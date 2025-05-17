@@ -15,18 +15,77 @@ import random
 import copy
 from fuzzywuzzy import fuzz, process
 
+# Import our custom n-gram matching module
+from .ngram_matcher import enhanced_title_similarity
+
 logger = logging.getLogger(__name__)
 
 def normalize_title(title: str) -> str:
-    """Normalize title for better matching."""
+    """Normalize title for better matching.
+    
+    Enhanced to handle various special cases like XML/HTML tags,
+    special characters, different quote styles, academic notation, etc.
+    """
     if not title:
         return ""
+    
+    # Remove all HTML/XML tags
+    title = re.sub(r'<[^>]+>', '', title)
     
     # Convert to lowercase
     title = title.lower()
     
     # Remove HTML entities
-    title = re.sub(r'&[a-z]+;', ' ', title)
+    title = re.sub(r'&[a-z0-9]+;', ' ', title)
+    
+    # Standardize common academic notation
+    title = re.sub(r'\b(?:vs\.|vs|versus)\b', 'vs', title)  # Standardize versus/vs./vs
+    title = re.sub(r'\bp\s*(?:<|=|>)\s*[0-9]\.?[0-9]*\b', '', title)  # Remove p-values
+    title = re.sub(r'\bdoi:\s*[^\s]+\b', '', title)  # Remove DOI references
+    title = re.sub(r'\b[0-9]+-[0-9]+\b', '', title)  # Remove page ranges
+    title = re.sub(r'\b[0-9]+(?:\.[0-9]+)?%\b', '', title)  # Remove percentages
+    
+    # Handle common academic notations
+    title = re.sub(r'\([^)]*\)', '', title)  # Remove parenthetical phrases
+    title = re.sub(r'\[[^]]*\]', '', title)  # Remove bracketed text
+    
+    # Standardize common variations
+    replacements = [
+        # Standardize dashes and hyphens
+        ('–', '-'),  # en-dash
+        ('—', '-'),  # em-dash
+        ('‐', '-'),  # hyphen
+        # Standardize quotes
+        ('"', ''),  # left double quote
+        ('"', ''),  # right double quote
+        (''', ''),  # left single quote
+        (''', ''),  # right single quote
+        ('\"', ''),  # double quote
+        ('\'', ''),  # single quote
+        # Standardize spaces
+        ('\t', ' '),  # tab
+        ('\n', ' '),  # newline
+        ('\r', ' '),  # carriage return
+        # Other common characters
+        ('\u2019', ''),  # right single quotation mark
+        ('\u2018', ''),  # left single quotation mark
+        # Common academic terminology replacements
+        ('randomized controlled trial', 'rct'),
+        ('systematic review', 'review'),
+        ('meta analysis', 'metaanalysis'),
+        ('meta-analysis', 'metaanalysis'),
+        ('cross-sectional', 'crosssectional'),
+        ('double-blind', 'doubleblind'),
+        ('cohort study', 'cohort'),
+        ('case control', 'casecontrol'),
+        ('randomised', 'randomized'),  # UK/US spelling differences
+        ('analysing', 'analyzing'),
+        ('colour', 'color'),
+        ('centre', 'center'),
+    ]
+    
+    for old, new in replacements:
+        title = title.replace(old, new)
     
     # Normalize unicode characters (accents, special chars)
     import unicodedata
@@ -40,13 +99,20 @@ def normalize_title(title: str) -> str:
     
     # Remove common words that don't contribute to matching
     stopwords = ['a', 'an', 'the', 'and', 'or', 'but', 'of', 'in', 'on', 'at', 'to', 'for', 'with',
-                'by', 'as', 'is', 'are', 'was', 'were', 'be', 'this', 'that', 'from']
+                'by', 'as', 'is', 'are', 'was', 'were', 'be', 'this', 'that', 'from',
+                # Additional academic stopwords
+                'review', 'study', 'analysis', 'research', 'article', 'journal', 'paper',
+                'versus', 'vs', 'using', 'based', 'between', 'among', 'among', 'within',
+                'evaluation', 'assessment', 'analysis', 'role', 'impact', 'effect', 'effects',
+                'outcomes', 'results', 'method', 'methods', 'approach', 'approaches',
+                'evidence', 'model', 'models', 'framework', 'frameworks',
+                'part', 'i', 'ii', 'iii', 'iv', 'v', 'vi', 'vii', 'viii', 'ix', 'x']
     title_words = title.split()
     title_words = [word for word in title_words if word not in stopwords]
     
     return ' '.join(title_words)
 
-def fuzzy_title_match(title1: str, title2: str, threshold: int = 90) -> bool:
+def fuzzy_title_match(title1: str, title2: str, threshold: int = 85) -> bool:
     """Check if two titles match using fuzzy matching.
     
     Args:
@@ -72,7 +138,7 @@ def fuzzy_title_match(title1: str, title2: str, threshold: int = 90) -> bool:
     return score >= threshold
 
 
-def fuzzy_title_match_with_year(title1: str, title2: str, year1=None, year2=None, threshold: int = 90) -> tuple:
+def fuzzy_title_match_with_year(title1: str, title2: str, year1=None, year2=None, threshold: int = 85) -> tuple:
     """Check if two titles match using fuzzy matching, with optional publication year filtering.
     
     Args:
@@ -113,127 +179,139 @@ def fuzzy_title_match_with_year(title1: str, title2: str, year1=None, year2=None
     logger.debug(f"Fuzzy match score: {score} for '{title1}' and '{title2}'")
     return score >= threshold, score
 
-def find_best_title_match(search_title: str, candidates: List[Dict], threshold: int = 90, 
+def find_best_title_match(search_title: str, candidates: List[Dict], threshold: int = 85, 
                        search_year=None, search_authors=None) -> Optional[Dict]:
-    """Find best matching title in a list of candidates with improved matching using year and author data.
+    """Find best matching title in a list of candidates with improved matching using n-gram matching,
+    fuzzy matching, year and author data.
     
     Args:
         search_title: Title to search for
         candidates: List of dictionaries containing candidate titles
         threshold: Minimum score to consider a match (0-100)
-        search_year: Publication year for filtering (optional)
-        search_authors: List of author names for enhancing match quality (optional)
+        search_year: Optional publication year to use for filtering
+        search_authors: Optional list of authors to boost confidence in matches
         
     Returns:
         Optional[Dict]: Best matching candidate or None if no match found.
-                       Adds a 'match_info' key with matching details for verification.
     """
     if not candidates:
         return None
-    
-    # Normalize search title
+        
+    # Normalize the search title
     norm_search_title = normalize_title(search_title)
     
-    best_score = 0
+    # Find the best match
     best_match = None
-    best_score_type = None
-    best_author_bonus = 0
+    best_score = 0
+    best_match_info = {}
     
     for candidate in candidates:
         if 'title' in candidate and candidate['title']:
-            # Check year if available
+            # Extract years if present to filter out obviously wrong matches
             candidate_year = candidate.get('year') or candidate.get('publication_year') or None
             if search_year and candidate_year:
                 try:
-                    # Extract 4-digit years from strings if needed
+                    # Convert years to integers for comparison
                     search_year_int = int(re.search(r'\d{4}', str(search_year)).group(0)) if re.search(r'\d{4}', str(search_year)) else None
                     candidate_year_int = int(re.search(r'\d{4}', str(candidate_year)).group(0)) if re.search(r'\d{4}', str(candidate_year)) else None
                     
-                    # Skip if years differ by more than 1
+                    # Filter out candidates with year difference > 1
                     if search_year_int and candidate_year_int and abs(search_year_int - candidate_year_int) > 1:
                         continue
-                except (ValueError, AttributeError, TypeError):
-                    # If there's any error parsing years, don't filter by year
+                except (ValueError, AttributeError):
+                    # If there's an error parsing the years, don't apply the filter
                     pass
             
-            # Get both token sort and token set ratios
+            # --- STANDARD FUZZY MATCHING ---
+            # Calculate fuzzy match scores 
             token_sort_ratio = fuzz.token_sort_ratio(norm_search_title, normalize_title(candidate['title']))
             token_set_ratio = fuzz.token_set_ratio(norm_search_title, normalize_title(candidate['title']))
             
-            # Use the higher of the two scores
-            score = max(token_sort_ratio, token_set_ratio)
-            score_type = "token_sort_ratio" if token_sort_ratio > token_set_ratio else "token_set_ratio"
+            # Take the best scoring method
+            base_score = max(token_sort_ratio, token_set_ratio)
+            match_type = "token_set_ratio" if token_set_ratio >= token_sort_ratio else "token_sort_ratio"
             
-            # Calculate author bonus if authors are available
+            # --- N-GRAM MATCHING (Additional technique) ---
+            # Try enhanced n-gram matching if the fuzzy score is below a good threshold
+            # This can help with differently abbreviated titles
+            if base_score < 90:  # Only use n-gram if fuzzy matching isn't already strong
+                ngram_score, ngram_technique = enhanced_title_similarity(search_title, candidate['title'])
+                # Convert the 0-1 score to 0-100 scale
+                ngram_score_100 = int(ngram_score * 100)
+                
+                # If the n-gram matching produces a better score, use it instead
+                if ngram_score_100 > base_score + 5:  # Only replace if significantly better
+                    base_score = ngram_score_100
+                    match_type = ngram_technique
+            
+            # Start with the base score from the best matching technique
+            adjusted_score = base_score
+            
+            # --- AUTHOR MATCHING ---
+            # Bonus points for author match
             author_bonus = 0
             if search_authors and (candidate.get('authors') or candidate.get('author')):
-                # Extract and normalize candidate authors
+                # Extract and normalize search authors
+                search_last_names = set()
+                for author in search_authors:
+                    if isinstance(author, str):
+                        parts = author.split()
+                        if parts:
+                            search_last_names.add(parts[-1].lower())
+                
+                # Extract last names from candidate authors
                 candidate_authors = candidate.get('authors', [])
                 if not candidate_authors and candidate.get('author'):
-                    # Handle single author field or comma-separated list
+                    # Handle different author formats
                     if isinstance(candidate['author'], str):
                         candidate_authors = [a.strip() for a in candidate['author'].split(',')] 
                     elif isinstance(candidate['author'], list):
                         candidate_authors = candidate['author']
                 
-                # Convert author lists to sets of last names
-                search_last_names = set()
                 candidate_last_names = set()
-                
-                # Extract last names from search authors
-                for author in search_authors:
-                    if isinstance(author, str):
-                        parts = author.split()
-                        if parts:  # Make sure there's at least one part
-                            search_last_names.add(parts[-1].lower())
-                
-                # Extract last names from candidate authors
                 for author in candidate_authors:
                     if isinstance(author, str):
                         parts = author.split()
-                        if parts:  # Make sure there's at least one part
+                        if parts:
                             candidate_last_names.add(parts[-1].lower())
                 
-                # Calculate author overlap and bonus
                 if search_last_names and candidate_last_names:
                     overlap = len(search_last_names.intersection(candidate_last_names))
                     if overlap > 0:
-                        # Add 1-5 points bonus for author matches (more authors = more bonus)
-                        author_bonus = min(5, overlap)
-                        # More significant bonus for first author match (often most important)
+                        # Add bonus for author match - more for first author match
+                        author_bonus = min(8, overlap * 2)  # Increased author bonus 
+                        
+                        # Extra bonus if first author matches
                         if len(search_authors) > 0 and len(candidate_authors) > 0:
                             try:
                                 search_first = search_authors[0].split()[-1].lower() if isinstance(search_authors[0], str) else ""
                                 candidate_first = candidate_authors[0].split()[-1].lower() if isinstance(candidate_authors[0], str) else ""
                                 if search_first and candidate_first and search_first == candidate_first:
-                                    author_bonus += 3  # Extra points for first author match
+                                    author_bonus += 5  # Increased first author bonus
                             except (IndexError, AttributeError):
                                 pass
             
-            # Add author bonus to score
-            adjusted_score = score + author_bonus
+            # Apply author bonus to adjusted score
+            adjusted_score += author_bonus
             
+            # Check if this is our best match so far
             if adjusted_score > best_score and adjusted_score >= threshold:
                 best_score = adjusted_score
                 best_match = candidate
-                best_score_type = score_type
-                best_author_bonus = author_bonus
+                best_match_info = {
+                    'fuzzy_matched': True,
+                    'query_title': search_title,
+                    'matched_title': candidate['title'],
+                    'match_score': adjusted_score,
+                    'base_score': base_score,
+                    'author_bonus': author_bonus,
+                    'match_type': match_type,
+                    'threshold': threshold
+                }
     
+    # Prepare the final best match with metadata
     if best_match:
-        base_score = best_score - best_author_bonus
-        logger.debug(f"Found title match with score {best_score} (base: {base_score}, author bonus: {best_author_bonus}): '{search_title}' -> '{best_match.get('title')}'")
-        
-        # Add match information to the result for verification
-        best_match['match_info'] = {
-            'fuzzy_matched': True,
-            'query_title': search_title,
-            'matched_title': best_match.get('title'),
-            'match_score': best_score,
-            'base_score': base_score,
-            'author_bonus': best_author_bonus,
-            'match_type': best_score_type,
-            'threshold': threshold
-        }
+        best_match['match_info'] = best_match_info
     
     return best_match
 
@@ -746,7 +824,11 @@ class APIClient:
                     if top_item.get('title'):
                         item_title = top_item['title'][0] if isinstance(top_item['title'], list) else top_item['title']
                         
-                        if item_title.lower() == title.lower():
+                        # Use normalized titles for more robust exact matching
+                        normalized_item_title = normalize_title(item_title)
+                        normalized_query_title = normalize_title(title)
+                        
+                        if normalized_item_title == normalized_query_title:
                             # Exact match found
                             self.match_stats['crossref']['exact_match_successes'] += 1
                             
@@ -837,7 +919,7 @@ class APIClient:
                     search_authors = None
                     
                     # Use a high threshold (90) for fuzzy matching to ensure quality matches
-                    best_match = find_best_title_match(title, candidates, threshold=90, 
+                    best_match = find_best_title_match(title, candidates, threshold=85, 
                                                       search_year=search_year, search_authors=search_authors)
                     
                     if best_match:
@@ -944,10 +1026,14 @@ class APIClient:
                 exact_data['data'][0].get('abstract') and exact_data['data'][0].get('title')):
                 
                 paper = exact_data['data'][0]
-                # Check if titles match exactly (case-insensitive)
-                if paper.get('title').lower() == title.lower():
-                    self.match_stats['semantic_scholar']['exact_match_successes'] += 1
-                    result = {
+                # Check if titles match exactly using normalized titles
+                if paper.get('title'):
+                    normalized_paper_title = normalize_title(paper.get('title'))
+                    normalized_query_title = normalize_title(title)
+                    
+                    if normalized_paper_title == normalized_query_title:
+                        self.match_stats['semantic_scholar']['exact_match_successes'] += 1
+                        result = {
                         'title': paper.get('title'),
                         'doi': paper.get('doi'),
                         'abstract': paper.get('abstract'),
@@ -1005,7 +1091,7 @@ class APIClient:
                 search_authors = None
                 
                 # Find best match using enhanced fuzzy matching with high threshold (90%)
-                best_match = find_best_title_match(title, candidates, threshold=90, 
+                best_match = find_best_title_match(title, candidates, threshold=85, 
                                                 search_year=search_year, search_authors=search_authors)
                 
                 if best_match:
@@ -1054,10 +1140,15 @@ class APIClient:
                 len(exact_data['search-results']['entry']) > 0):
                 
                 entry = exact_data['search-results']['entry'][0]
-                # Check if titles match exactly (case-insensitive)
-                if entry.get('dc:title') and entry.get('dc:title').lower() == title.lower():
-                    self.match_stats['elsevier']['exact_match_successes'] += 1
-                    result = {
+                # Check if titles match exactly using normalized titles
+                if entry.get('dc:title'):
+                    normalized_entry_title = normalize_title(entry.get('dc:title'))
+                    normalized_query_title = normalize_title(title)
+                    
+                    # Use normalized title comparison for more robust exact matching
+                    if normalized_entry_title == normalized_query_title:
+                        self.match_stats['elsevier']['exact_match_successes'] += 1
+                        result = {
                         'title': entry.get('dc:title'),
                         'doi': entry.get('prism:doi'),
                         'abstract': entry.get('dc:description'),
@@ -1126,8 +1217,8 @@ class APIClient:
                 search_year = None  # We would need to extract this from the source publication if available
                 search_authors = None  # We would need to extract this from the source publication if available
                 
-                # Find best match using fuzzy matching with high threshold (90%)
-                best_match = find_best_title_match(title, candidates, threshold=90,
+                # Find best match using fuzzy matching with moderate threshold (85%)
+                best_match = find_best_title_match(title, candidates, threshold=85,
                                                  search_year=search_year, search_authors=search_authors)
                 
                 if best_match:
@@ -1323,10 +1414,14 @@ class APIClient:
                 abstract_match = re.search(r'<AbstractText[^>]*>([\s\S]*?)</AbstractText>', xml_text)
                 doi_match = re.search(r'<ArticleId IdType="doi">([^<]+)</ArticleId>', xml_text)
                 
-                # Check if we got a valid abstract and the title exactly matches
-                if abstract_match and title_match and title_match.group(1).lower() == title.lower():
-                    self.match_stats['pubmed']['exact_match_successes'] += 1
-                    result = {
+                # Check if we got a valid abstract and the title matches using normalized comparison
+                if abstract_match and title_match:
+                    normalized_result_title = normalize_title(title_match.group(1))
+                    normalized_query_title = normalize_title(title)
+                    
+                    if normalized_result_title == normalized_query_title:
+                        self.match_stats['pubmed']['exact_match_successes'] += 1
+                        result = {
                         'title': title_match.group(1),
                         'doi': doi_match.group(1) if doi_match else None,
                         'abstract': abstract_match.group(1),
@@ -1419,7 +1514,7 @@ class APIClient:
                 
                 # Apply fuzzy matching to find the best match
                 if candidates:
-                    best_match = find_best_title_match(title, candidates, threshold=90)
+                    best_match = find_best_title_match(title, candidates, threshold=85)
                     
                     if best_match:
                         self.match_stats['pubmed']['fuzzy_match_successes'] += 1
