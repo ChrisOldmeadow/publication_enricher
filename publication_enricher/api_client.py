@@ -12,6 +12,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 import urllib.parse
 import re
 import random
+import copy
 from fuzzywuzzy import fuzz, process
 
 logger = logging.getLogger(__name__)
@@ -24,14 +25,22 @@ def normalize_title(title: str) -> str:
     # Convert to lowercase
     title = title.lower()
     
-    # Replace common punctuation and special characters
-    title = re.sub(r'[\-_:;,.!?\[\](){}"\'\\]', ' ', title)
+    # Remove HTML entities
+    title = re.sub(r'&[a-z]+;', ' ', title)
+    
+    # Normalize unicode characters (accents, special chars)
+    import unicodedata
+    title = unicodedata.normalize('NFKD', title).encode('ASCII', 'ignore').decode('utf-8')
+    
+    # Replace all punctuation with spaces
+    title = re.sub(r'[^\w\s]', ' ', title)
     
     # Replace multiple spaces with a single space
     title = re.sub(r'\s+', ' ', title).strip()
     
     # Remove common words that don't contribute to matching
-    stopwords = ['a', 'an', 'the', 'and', 'or', 'but', 'of', 'in', 'on', 'at', 'to', 'for', 'with']
+    stopwords = ['a', 'an', 'the', 'and', 'or', 'but', 'of', 'in', 'on', 'at', 'to', 'for', 'with',
+                'by', 'as', 'is', 'are', 'was', 'were', 'be', 'this', 'that', 'from']
     title_words = title.split()
     title_words = [word for word in title_words if word not in stopwords]
     
@@ -62,13 +71,58 @@ def fuzzy_title_match(title1: str, title2: str, threshold: int = 90) -> bool:
     logger.debug(f"Fuzzy match score: {score} for '{title1}' and '{title2}'")
     return score >= threshold
 
-def find_best_title_match(search_title: str, candidates: List[Dict], threshold: int = 90) -> Optional[Dict]:
-    """Find best matching title in a list of candidates.
+
+def fuzzy_title_match_with_year(title1: str, title2: str, year1=None, year2=None, threshold: int = 90) -> tuple:
+    """Check if two titles match using fuzzy matching, with optional publication year filtering.
+    
+    Args:
+        title1: First title
+        title2: Second title
+        year1: Publication year for title1 (optional)
+        year2: Publication year for title2 (optional)
+        threshold: Minimum score to consider a match (0-100)
+        
+    Returns:
+        tuple: (is_match, score) - True/False if titles match above threshold and the matching score
+    """
+    # If both years are provided, filter out matches with year difference > 1
+    if year1 and year2:
+        try:
+            # Handle various formats and potential non-numeric years
+            year1_int = int(re.search(r'\d{4}', str(year1)).group(0)) if re.search(r'\d{4}', str(year1)) else None
+            year2_int = int(re.search(r'\d{4}', str(year2)).group(0)) if re.search(r'\d{4}', str(year2)) else None
+            
+            if year1_int and year2_int and abs(year1_int - year2_int) > 1:
+                logger.debug(f"Year mismatch: {year1_int} vs {year2_int}")
+                return False, 0
+        except (ValueError, AttributeError, TypeError):
+            # If there's any error parsing years, skip year filtering
+            pass
+    
+    # Normalize titles first
+    norm_title1 = normalize_title(title1)
+    norm_title2 = normalize_title(title2)
+    
+    # Get both token sort and token set ratios (handles word order and subset matches)
+    token_sort_ratio = fuzz.token_sort_ratio(norm_title1, norm_title2)
+    token_set_ratio = fuzz.token_set_ratio(norm_title1, norm_title2)
+    
+    # Use the higher of the two scores
+    score = max(token_sort_ratio, token_set_ratio)
+    
+    logger.debug(f"Fuzzy match score: {score} for '{title1}' and '{title2}'")
+    return score >= threshold, score
+
+def find_best_title_match(search_title: str, candidates: List[Dict], threshold: int = 90, 
+                       search_year=None, search_authors=None) -> Optional[Dict]:
+    """Find best matching title in a list of candidates with improved matching using year and author data.
     
     Args:
         search_title: Title to search for
         candidates: List of dictionaries containing candidate titles
         threshold: Minimum score to consider a match (0-100)
+        search_year: Publication year for filtering (optional)
+        search_authors: List of author names for enhancing match quality (optional)
         
     Returns:
         Optional[Dict]: Best matching candidate or None if no match found.
@@ -83,9 +137,25 @@ def find_best_title_match(search_title: str, candidates: List[Dict], threshold: 
     best_score = 0
     best_match = None
     best_score_type = None
+    best_author_bonus = 0
     
     for candidate in candidates:
         if 'title' in candidate and candidate['title']:
+            # Check year if available
+            candidate_year = candidate.get('year') or candidate.get('publication_year') or None
+            if search_year and candidate_year:
+                try:
+                    # Extract 4-digit years from strings if needed
+                    search_year_int = int(re.search(r'\d{4}', str(search_year)).group(0)) if re.search(r'\d{4}', str(search_year)) else None
+                    candidate_year_int = int(re.search(r'\d{4}', str(candidate_year)).group(0)) if re.search(r'\d{4}', str(candidate_year)) else None
+                    
+                    # Skip if years differ by more than 1
+                    if search_year_int and candidate_year_int and abs(search_year_int - candidate_year_int) > 1:
+                        continue
+                except (ValueError, AttributeError, TypeError):
+                    # If there's any error parsing years, don't filter by year
+                    pass
+            
             # Get both token sort and token set ratios
             token_sort_ratio = fuzz.token_sort_ratio(norm_search_title, normalize_title(candidate['title']))
             token_set_ratio = fuzz.token_set_ratio(norm_search_title, normalize_title(candidate['title']))
@@ -94,13 +164,64 @@ def find_best_title_match(search_title: str, candidates: List[Dict], threshold: 
             score = max(token_sort_ratio, token_set_ratio)
             score_type = "token_sort_ratio" if token_sort_ratio > token_set_ratio else "token_set_ratio"
             
-            if score > best_score and score >= threshold:
-                best_score = score
+            # Calculate author bonus if authors are available
+            author_bonus = 0
+            if search_authors and (candidate.get('authors') or candidate.get('author')):
+                # Extract and normalize candidate authors
+                candidate_authors = candidate.get('authors', [])
+                if not candidate_authors and candidate.get('author'):
+                    # Handle single author field or comma-separated list
+                    if isinstance(candidate['author'], str):
+                        candidate_authors = [a.strip() for a in candidate['author'].split(',')] 
+                    elif isinstance(candidate['author'], list):
+                        candidate_authors = candidate['author']
+                
+                # Convert author lists to sets of last names
+                search_last_names = set()
+                candidate_last_names = set()
+                
+                # Extract last names from search authors
+                for author in search_authors:
+                    if isinstance(author, str):
+                        parts = author.split()
+                        if parts:  # Make sure there's at least one part
+                            search_last_names.add(parts[-1].lower())
+                
+                # Extract last names from candidate authors
+                for author in candidate_authors:
+                    if isinstance(author, str):
+                        parts = author.split()
+                        if parts:  # Make sure there's at least one part
+                            candidate_last_names.add(parts[-1].lower())
+                
+                # Calculate author overlap and bonus
+                if search_last_names and candidate_last_names:
+                    overlap = len(search_last_names.intersection(candidate_last_names))
+                    if overlap > 0:
+                        # Add 1-5 points bonus for author matches (more authors = more bonus)
+                        author_bonus = min(5, overlap)
+                        # More significant bonus for first author match (often most important)
+                        if len(search_authors) > 0 and len(candidate_authors) > 0:
+                            try:
+                                search_first = search_authors[0].split()[-1].lower() if isinstance(search_authors[0], str) else ""
+                                candidate_first = candidate_authors[0].split()[-1].lower() if isinstance(candidate_authors[0], str) else ""
+                                if search_first and candidate_first and search_first == candidate_first:
+                                    author_bonus += 3  # Extra points for first author match
+                            except (IndexError, AttributeError):
+                                pass
+            
+            # Add author bonus to score
+            adjusted_score = score + author_bonus
+            
+            if adjusted_score > best_score and adjusted_score >= threshold:
+                best_score = adjusted_score
                 best_match = candidate
                 best_score_type = score_type
+                best_author_bonus = author_bonus
     
     if best_match:
-        logger.debug(f"Found title match with score {best_score}: '{search_title}' -> '{best_match.get('title')}'")
+        base_score = best_score - best_author_bonus
+        logger.debug(f"Found title match with score {best_score} (base: {base_score}, author bonus: {best_author_bonus}): '{search_title}' -> '{best_match.get('title')}'")
         
         # Add match information to the result for verification
         best_match['match_info'] = {
@@ -108,6 +229,8 @@ def find_best_title_match(search_title: str, candidates: List[Dict], threshold: 
             'query_title': search_title,
             'matched_title': best_match.get('title'),
             'match_score': best_score,
+            'base_score': base_score,
+            'author_bonus': best_author_bonus,
             'match_type': best_score_type,
             'threshold': threshold
         }
@@ -123,7 +246,9 @@ class APIClient:
                  semantic_scholar_api_key: str = None,
                  cache_db: str = "api_cache.db",
                  max_concurrent: int = 10,
-                 cache_ttl_days: int = 30):
+                 cache_ttl_days: int = 30,
+                 disable_pubmed: bool = False,
+                 disable_semantic_scholar: bool = False):
         
         """
         Initialize the API client.
@@ -136,6 +261,8 @@ class APIClient:
             cache_db: Path to SQLite cache database
             max_concurrent: Maximum number of concurrent API requests
             cache_ttl_days: Number of days to keep cache entries
+            disable_pubmed: Set to True to disable PubMed API lookups
+            disable_semantic_scholar: Set to True to disable Semantic Scholar API lookups
         """
         # API keys and credentials
         self.elsevier_api_key = elsevier_api_key
@@ -148,6 +275,10 @@ class APIClient:
         self.has_pubmed = (self.pubmed_email is not None) or (self.pubmed_api_key is not None)
         self.has_crossref = True  # Crossref has a public API that works without auth
         self.has_semantic_scholar = True  # Semantic Scholar has a public API with rate limits
+        
+        # API disable flags
+        self.pubmed_disabled = disable_pubmed
+        self.semantic_scholar_disabled = disable_semantic_scholar
         
         # Match statistics tracking
         self.match_stats = {
@@ -473,6 +604,9 @@ class APIClient:
         """Get publication metadata from Elsevier API by DOI."""
         cache_key = f"doi:{doi}"
         
+        # Count DOI lookup as an exact match attempt
+        self.match_stats['elsevier']['exact_match_attempts'] += 1
+        
         # Check cache first
         cached = await self.get_from_cache(cache_key)
         if cached:
@@ -484,6 +618,9 @@ class APIClient:
                         self.match_stats[source]['fuzzy_match_successes'] += 1
                     else:
                         self.match_stats[source]['exact_match_successes'] += 1
+            else:
+                # Count cache hit as an exact match success if it doesn't have match_info
+                self.match_stats['elsevier']['exact_match_successes'] += 1
             return cached
         
         try:
@@ -495,9 +632,16 @@ class APIClient:
                     'title': data['full-text-retrieval-response'].get('coredata', {}).get('dc:title'),
                     'doi': doi,
                     'abstract': data['full-text-retrieval-response'].get('coredata', {}).get('dc:description'),
-                    'source': 'elsevier'
+                    'source': 'elsevier',
+                    'match_info': {
+                        'fuzzy_matched': False,
+                        'query_doi': doi,
+                        'match_type': 'doi'
+                    }
                 }
                 await self.save_to_cache(cache_key, result)
+                # Count as exact match success
+                self.match_stats['elsevier']['exact_match_successes'] += 1
                 return result
                 
         except Exception as e:
@@ -511,11 +655,16 @@ class APIClient:
         if not self.has_crossref:
             return None
             
+        # Count DOI lookup as an exact match attempt
+        self.match_stats['crossref']['exact_match_attempts'] += 1
+            
         cache_key = f"crossref_doi:{doi}"
         
         # Check cache first
         cached = await self.get_from_cache(cache_key)
         if cached:
+            # Count cache hit as an exact match success
+            self.match_stats['crossref']['exact_match_successes'] += 1
             return cached
         
         try:
@@ -533,9 +682,16 @@ class APIClient:
                     'title': title,
                     'doi': doi,
                     'abstract': abstract,  # Often None from Crossref
-                    'source': 'crossref'
+                    'source': 'crossref',
+                    'match_info': {
+                        'fuzzy_matched': False,
+                        'query_doi': doi,
+                        'match_type': 'doi'
+                    }
                 }
                 await self.save_to_cache(cache_key, result)
+                # Count as exact match success
+                self.match_stats['crossref']['exact_match_successes'] += 1
                 return result
                 
         except Exception as e:
@@ -652,8 +808,37 @@ class APIClient:
                                 'source': 'crossref'
                             })
                     
-                    # Find best match using fuzzy matching
-                    best_match = find_best_title_match(title, candidates, threshold=90)
+                    # Extract year information if available in items
+                    for item in items:
+                        if item.get('title'):
+                            # Look for year in different possible locations
+                            year = None
+                            if item.get('published-print') and item['published-print'].get('date-parts'):
+                                year = item['published-print']['date-parts'][0][0] if item['published-print']['date-parts'][0] else None
+                            elif item.get('published-online') and item['published-online'].get('date-parts'):
+                                year = item['published-online']['date-parts'][0][0] if item['published-online']['date-parts'][0] else None
+                            elif item.get('created') and item['created'].get('date-parts'):
+                                year = item['created']['date-parts'][0][0] if item['created']['date-parts'][0] else None
+                            
+                            # Try to extract authors if available
+                            authors = []
+                            if item.get('author'):
+                                authors = [f"{a.get('given', '')} {a.get('family', '')}" for a in item['author'] if a.get('family')]
+                            
+                            # Update the candidate with year and author info
+                            for candidate in candidates:
+                                if candidate.get('doi') == item.get('DOI'):
+                                    candidate['year'] = year
+                                    candidate['authors'] = authors
+                    
+                    # Find best match using enhanced fuzzy matching with year and author data
+                    # Extract year from the query title's publication if available
+                    search_year = None
+                    search_authors = None
+                    
+                    # Use a high threshold (90) for fuzzy matching to ensure quality matches
+                    best_match = find_best_title_match(title, candidates, threshold=90, 
+                                                      search_year=search_year, search_authors=search_authors)
                     
                     if best_match:
                         self.match_stats['crossref']['fuzzy_match_successes'] += 1
@@ -669,6 +854,13 @@ class APIClient:
     
     async def get_abstract_from_semantic_scholar_by_doi(self, session: aiohttp.ClientSession, doi: str) -> Optional[Dict]:
         """Get publication metadata from Semantic Scholar by DOI."""
+        # Return None if Semantic Scholar API is disabled
+        if self.semantic_scholar_disabled:
+            return None
+            
+        # Count DOI lookup as an exact match attempt
+        self.match_stats['semantic_scholar']['exact_match_attempts'] += 1
+        
         cache_key = f"semantic_scholar_doi:{doi}"
         
         # Check cache first
@@ -680,6 +872,9 @@ class APIClient:
                     self.match_stats['semantic_scholar']['fuzzy_match_successes'] += 1
                 else:
                     self.match_stats['semantic_scholar']['exact_match_successes'] += 1
+            else:
+                # Count cache hit as an exact match success if it doesn't have match_info
+                self.match_stats['semantic_scholar']['exact_match_successes'] += 1
             return cached
         
         try:
@@ -703,6 +898,8 @@ class APIClient:
                     }
                 }
                 await self.save_to_cache(cache_key, result)
+                # Count as exact match success
+                self.match_stats['semantic_scholar']['exact_match_successes'] += 1
                 return result
                 
         except Exception as e:
@@ -713,6 +910,10 @@ class APIClient:
 
     async def get_abstract_from_semantic_scholar_by_title(self, session: aiohttp.ClientSession, title: str) -> Optional[Dict]:
         """Search for publication by title using Semantic Scholar API with exact matching first, then fuzzy matching as fallback."""
+        # Return None if Semantic Scholar API is disabled
+        if self.semantic_scholar_disabled:
+            return None
+            
         cache_key = f"semantic_scholar_title:{title}"
         
         # Check cache first
@@ -777,16 +978,35 @@ class APIClient:
             fuzzy_data = await self._make_request(session, url, fuzzy_params, source='semantic_scholar')
             
             if fuzzy_data and fuzzy_data.get('data') and len(fuzzy_data['data']) > 0:
-                # Prepare candidates for fuzzy matching
-                candidates = [{
-                    'title': paper.get('title'),
-                    'doi': paper.get('doi'),
-                    'abstract': paper.get('abstract'),
-                    'source': 'semantic_scholar'
-                } for paper in fuzzy_data['data'] if paper.get('abstract')]
+                # Prepare candidates for fuzzy matching with additional metadata
+                candidates = []
+                for paper in fuzzy_data['data']:
+                    if paper.get('abstract'):
+                        # Create base candidate
+                        candidate = {
+                            'title': paper.get('title'),
+                            'doi': paper.get('doi'),
+                            'abstract': paper.get('abstract'),
+                            'source': 'semantic_scholar'
+                        }
+                        
+                        # Add year information if available
+                        if paper.get('year'):
+                            candidate['year'] = paper.get('year')
+                            
+                        # Add author information if available
+                        if paper.get('authors'):
+                            candidate['authors'] = [author.get('name') for author in paper.get('authors', []) if author.get('name')]
+                            
+                        candidates.append(candidate)
                 
-                # Find best match using fuzzy matching with high threshold (90%)
-                best_match = find_best_title_match(title, candidates, threshold=90)
+                # Extract search metadata if available
+                search_year = None
+                search_authors = None
+                
+                # Find best match using enhanced fuzzy matching with high threshold (90%)
+                best_match = find_best_title_match(title, candidates, threshold=90, 
+                                                search_year=search_year, search_authors=search_authors)
                 
                 if best_match:
                     self.match_stats['semantic_scholar']['fuzzy_match_successes'] += 1
@@ -873,16 +1093,42 @@ class APIClient:
             if 'search-results' in fuzzy_data and fuzzy_data['search-results'].get('entry'):
                 entries = fuzzy_data['search-results']['entry']
                 
-                # Prepare candidate list for fuzzy matching
-                candidates = [{
-                    'title': entry.get('dc:title'),
-                    'doi': entry.get('prism:doi'),
-                    'abstract': entry.get('dc:description'),
-                    'source': 'elsevier'
-                } for entry in entries]
+                # Prepare candidate list for fuzzy matching with enhanced metadata
+                candidates = []
+                for entry in entries:
+                    # Create base candidate
+                    candidate = {
+                        'title': entry.get('dc:title'),
+                        'doi': entry.get('prism:doi'),
+                        'abstract': entry.get('dc:description'),
+                        'source': 'elsevier'
+                    }
+                    
+                    # Add publication year if available
+                    if entry.get('prism:coverDate'):
+                        # Extract year from date format YYYY-MM-DD
+                        date_match = re.search(r'(\d{4})-\d{2}-\d{2}', entry.get('prism:coverDate'))
+                        if date_match:
+                            candidate['year'] = date_match.group(1)
+                    
+                    # Add author information if available
+                    if entry.get('dc:creator'):
+                        candidate['authors'] = [entry.get('dc:creator')]
+                    elif entry.get('author'):
+                        if isinstance(entry.get('author'), list):
+                            candidate['authors'] = [author.get('authname') for author in entry.get('author', []) if author.get('authname')]
+                        else:
+                            candidate['authors'] = [entry.get('author')]
+                    
+                    candidates.append(candidate)
+                
+                # Find best match using enhanced fuzzy matching with year and author data
+                search_year = None  # We would need to extract this from the source publication if available
+                search_authors = None  # We would need to extract this from the source publication if available
                 
                 # Find best match using fuzzy matching with high threshold (90%)
-                best_match = find_best_title_match(title, candidates, threshold=90)
+                best_match = find_best_title_match(title, candidates, threshold=90,
+                                                 search_year=search_year, search_authors=search_authors)
                 
                 if best_match:
                     self.match_stats['elsevier']['fuzzy_match_successes'] += 1
@@ -901,6 +1147,9 @@ class APIClient:
         if not self.has_pubmed or self.pubmed_disabled:
             return None
             
+        # Count DOI lookup as an exact match attempt
+        self.match_stats['pubmed']['exact_match_attempts'] += 1
+            
         # Check if we've hit the error threshold
         if self.pubmed_error_count >= self.pubmed_error_threshold:
             logger.warning(f"PubMed API disabled due to {self.pubmed_error_count} consecutive errors")
@@ -912,6 +1161,8 @@ class APIClient:
         # Check cache first
         cached = await self.get_from_cache(cache_key)
         if cached:
+            # Count cache hit as an exact match success
+            self.match_stats['pubmed']['exact_match_successes'] += 1
             return cached
         
         try:
@@ -970,9 +1221,16 @@ class APIClient:
                         'doi': doi,
                         'abstract': abstract_match.group(1),
                         'pmid': pmid,
-                        'source': 'pubmed'
+                        'source': 'pubmed',
+                        'match_info': {
+                            'fuzzy_matched': False,
+                            'query_doi': doi,
+                            'match_type': 'doi'
+                        }
                     }
                     await self.save_to_cache(cache_key, result)
+                    # Count as exact match success
+                    self.match_stats['pubmed']['exact_match_successes'] += 1
                     return result
         
         except aiohttp.ClientResponseError as e:
@@ -1185,7 +1443,9 @@ class APIClient:
     
     async def verify_publications(self, publications: List[Dict]) -> List[Dict]:
         """
-        Verify a batch of publications in parallel, with multi-API fallback strategy.
+        Verify a batch of publications in parallel, with sequential API fallback strategy.
+        Tries APIs in order: Elsevier, Crossref, PubMed, Semantic Scholar.
+        Stops trying additional APIs once a match is found for a publication.
         
         Args:
             publications: List of dictionaries with 'title' and optional 'doi' keys
@@ -1193,18 +1453,102 @@ class APIClient:
         Returns:
             List of enriched publication dictionaries
         """
+        # Create a clean copy of match stats before we start
+        # This will be used to reset inflated statistics later
+        original_match_stats = copy.deepcopy(self.match_stats)
+        
         async with aiohttp.ClientSession() as session:
             # Initialize results for each publication
             results = [None] * len(publications)
             
-            # Track which publications need lookup by each API
-            need_lookup = list(range(len(publications)))
+            # Track publications with missing data
+            missing_data_indices = []
+            
+            # Check for publications with missing data first
+            for i, pub in enumerate(publications):
+                has_valid_doi = pub.get('doi') and str(pub['doi']).lower() != 'nan'
+                has_valid_title = pub.get('title') and str(pub['title']).strip() != ''
+                if not has_valid_doi and not has_valid_title:
+                    # Mark as having missing data
+                    missing_data_indices.append(i)
+                    # Add a marker to indicate why it couldn't be searched
+                    results[i] = {
+                        'source': 'none',
+                        'abstract': None,
+                        'match_info': {
+                            'fuzzy_matched': False,
+                            'match_type': 'none',
+                            'error': 'missing_data',
+                            'error_details': 'Publication missing both DOI and title'
+                        }
+                    }
+            
+            # Track which publications still need lookup (exclude ones with missing data)
+            need_lookup = [i for i in range(len(publications)) if i not in missing_data_indices]
             
             #-----------------------------------------------------
-            # PHASE 1: Try Crossref first for all publications (DOI first, then title)
+            # PHASE 1: Try Elsevier first (DOI lookup, then title search)
+            #-----------------------------------------------------
+            # STEP 1a: Try Elsevier DOI lookup for publications with DOIs
+            elsevier_doi_tasks = []
+            elsevier_doi_indices = []
+            
+            for i in need_lookup:
+                pub = publications[i]
+                if pub.get('doi') and str(pub['doi']).lower() != 'nan':
+                    task = self.get_abstract_by_doi(session, pub['doi'])
+                    elsevier_doi_tasks.append(task)
+                    elsevier_doi_indices.append(i)
+            
+            if elsevier_doi_tasks:
+                elsevier_doi_results = await asyncio.gather(*elsevier_doi_tasks, return_exceptions=True)
+                
+                # Process results and update who still needs lookup
+                still_need_lookup = []
+                for task_idx, pub_idx in enumerate(elsevier_doi_indices):
+                    result = elsevier_doi_results[task_idx]
+                    if not isinstance(result, Exception) and result is not None and result.get('abstract'):
+                        results[pub_idx] = result
+                    else:
+                        still_need_lookup.append(pub_idx)
+                
+                # Update need_lookup list to remove successful lookups
+                need_lookup = [idx for idx in need_lookup if idx in elsevier_doi_indices and idx in still_need_lookup] + \
+                            [idx for idx in need_lookup if idx not in elsevier_doi_indices]
+            
+            # STEP 1b: For remaining publications, try Elsevier title search
+            if need_lookup:  # Only continue if we still have publications that need lookup
+                elsevier_title_tasks = []
+                elsevier_title_indices = []
+                
+                for i in need_lookup:
+                    pub = publications[i]
+                    if pub.get('title'):
+                        task = self.get_abstract_by_title(session, pub['title'])
+                        elsevier_title_tasks.append(task)
+                        elsevier_title_indices.append(i)
+                
+                if elsevier_title_tasks:
+                    elsevier_title_results = await asyncio.gather(*elsevier_title_tasks, return_exceptions=True)
+                    
+                    # Process results
+                    still_need_lookup = []
+                    for task_idx, pub_idx in enumerate(elsevier_title_indices):
+                        result = elsevier_title_results[task_idx]
+                        if not isinstance(result, Exception) and result is not None and result.get('abstract'):
+                            results[pub_idx] = result
+                        else:
+                            still_need_lookup.append(pub_idx)
+                    
+                    # Update need_lookup list to remove successful lookups
+                    need_lookup = [idx for idx in need_lookup if idx in elsevier_title_indices and idx in still_need_lookup] + \
+                                [idx for idx in need_lookup if idx not in elsevier_title_indices]
+            
+            #-----------------------------------------------------
+            # PHASE 2: Try Crossref for publications that still need it
             #-----------------------------------------------------
             if self.has_crossref and need_lookup:
-                # STEP 1a: Try Crossref DOI lookup for publications with DOIs
+                # STEP 2a: Try Crossref DOI lookup for publications with DOIs
                 crossref_doi_tasks = []
                 crossref_doi_indices = []
                 
@@ -1229,68 +1573,41 @@ class APIClient:
                     
                     # Update need_lookup list to remove successful lookups
                     need_lookup = [idx for idx in need_lookup if idx in crossref_doi_indices and idx in still_need_lookup] + \
-                                 [idx for idx in need_lookup if idx not in crossref_doi_indices]
+                                [idx for idx in need_lookup if idx not in crossref_doi_indices]
                 
-                # STEP 1b: For remaining publications, try Crossref title lookup
-                crossref_title_tasks = []
-                crossref_title_indices = []
-                
-                for i in need_lookup:
-                    pub = publications[i]
-                    if pub.get('title'):
-                        task = self.get_abstract_from_crossref_by_title(session, pub['title'])
-                        crossref_title_tasks.append(task)
-                        crossref_title_indices.append(i)
-                
-                if crossref_title_tasks:
-                    crossref_title_results = await asyncio.gather(*crossref_title_tasks, return_exceptions=True)
+                # STEP 2b: For remaining publications, try Crossref title lookup
+                if need_lookup:  # Only continue if we still have publications that need lookup
+                    crossref_title_tasks = []
+                    crossref_title_indices = []
                     
-                    # Process results
-                    still_need_lookup = []
-                    for task_idx, pub_idx in enumerate(crossref_title_indices):
-                        result = crossref_title_results[task_idx]
-                        if not isinstance(result, Exception) and result is not None and result.get('abstract'):
-                            results[pub_idx] = result
-                        else:
-                            still_need_lookup.append(pub_idx)
+                    for i in need_lookup:
+                        pub = publications[i]
+                        if pub.get('title'):
+                            task = self.get_abstract_from_crossref_by_title(session, pub['title'])
+                            crossref_title_tasks.append(task)
+                            crossref_title_indices.append(i)
                     
-                    # Update need_lookup list to remove successful lookups
-                    need_lookup = [idx for idx in need_lookup if idx in crossref_title_indices and idx in still_need_lookup] + \
-                                 [idx for idx in need_lookup if idx not in crossref_title_indices]
+                    if crossref_title_tasks:
+                        crossref_title_results = await asyncio.gather(*crossref_title_tasks, return_exceptions=True)
+                        
+                        # Process results
+                        still_need_lookup = []
+                        for task_idx, pub_idx in enumerate(crossref_title_indices):
+                            result = crossref_title_results[task_idx]
+                            if not isinstance(result, Exception) and result is not None and result.get('abstract'):
+                                results[pub_idx] = result
+                            else:
+                                still_need_lookup.append(pub_idx)
+                        
+                        # Update need_lookup list to remove successful lookups
+                        need_lookup = [idx for idx in need_lookup if idx in crossref_title_indices and idx in still_need_lookup] + \
+                                    [idx for idx in need_lookup if idx not in crossref_title_indices]
             
-            #-----------------------------------------------------
-            # PHASE 2: Try Elsevier for publications that still need it
-            #-----------------------------------------------------
-            elsevier_tasks = []
-            elsevier_indices = []
-            
-            for i in need_lookup:
-                pub = publications[i]
-                if pub.get('doi') and str(pub['doi']).lower() != 'nan':
-                    task = self.get_abstract_by_doi(session, pub['doi'])
-                else:
-                    task = self.get_abstract_by_title(session, pub['title'])
-                elsevier_tasks.append(task)
-                elsevier_indices.append(i)
-            
-            if elsevier_tasks:
-                elsevier_results = await asyncio.gather(*elsevier_tasks, return_exceptions=True)
-                
-                # Process results and determine which publications still need lookup
-                still_need_lookup = []
-                for task_idx, pub_idx in enumerate(elsevier_indices):
-                    result = elsevier_results[task_idx]
-                    if not isinstance(result, Exception) and result is not None:
-                        results[pub_idx] = result
-                    else:
-                        still_need_lookup.append(pub_idx)
-                
-                need_lookup = still_need_lookup
-                
             #-----------------------------------------------------
             # PHASE 3: Try PubMed for publications that still need it
             #-----------------------------------------------------
             if self.has_pubmed and need_lookup:
+                # Only process publications that still need lookup
                 pubmed_tasks = []
                 pubmed_indices = []
                 
@@ -1310,44 +1627,92 @@ class APIClient:
                     still_need_lookup = []
                     for task_idx, pub_idx in enumerate(pubmed_indices):
                         result = pubmed_results[task_idx]
-                        if not isinstance(result, Exception) and result is not None:
+                        if not isinstance(result, Exception) and result is not None and result.get('abstract'):
                             results[pub_idx] = result
                         else:
                             still_need_lookup.append(pub_idx)
                     
+                    # Update need_lookup list
                     need_lookup = still_need_lookup
             
             #-----------------------------------------------------
             # PHASE 4: Try Semantic Scholar as last resort
             #-----------------------------------------------------
-            semantic_tasks = []
-            semantic_indices = []
-            
-            for i in need_lookup:
-                pub = publications[i]
-                if pub.get('doi') and str(pub['doi']).lower() != 'nan':
-                    task = self.get_abstract_from_semantic_scholar_by_doi(session, pub['doi'])
-                else:
-                    task = self.get_abstract_from_semantic_scholar_by_title(session, pub['title'])
-                semantic_tasks.append(task)
-                semantic_indices.append(i)
-            
-            if semantic_tasks:
-                semantic_results = await asyncio.gather(*semantic_tasks, return_exceptions=True)
+            if self.has_semantic_scholar and need_lookup:
+                # Only try this for publications that still need lookup
+                semantic_tasks = []
+                semantic_indices = []
                 
-                # Process results
-                for task_idx, pub_idx in enumerate(semantic_indices):
-                    result = semantic_results[task_idx]
-                    if not isinstance(result, Exception) and result is not None:
-                        results[pub_idx] = result
+                for i in need_lookup:
+                    pub = publications[i]
+                    if pub.get('doi') and str(pub['doi']).lower() != 'nan':
+                        task = self.get_abstract_from_semantic_scholar_by_doi(session, pub['doi'])
+                    else:
+                        task = self.get_abstract_from_semantic_scholar_by_title(session, pub['title'])
+                    semantic_tasks.append(task)
+                    semantic_indices.append(i)
+                
+                if semantic_tasks:
+                    semantic_results = await asyncio.gather(*semantic_tasks, return_exceptions=True)
+                    
+                    # Process results (no need to track still_need_lookup since this is the last API)
+                    for task_idx, pub_idx in enumerate(semantic_indices):
+                        result = semantic_results[task_idx]
+                        if not isinstance(result, Exception) and result is not None and result.get('abstract'):
+                            results[pub_idx] = result
             
             #-----------------------------------------------------
             # MERGE RESULTS back into original publications
             #-----------------------------------------------------
             enriched = []
+            
+            # We'll store the actual statistics from the processing
+            # These statistics reflect what actually happened during API calls
+            original_match_attempts = {}
+            for source, stats in self.match_stats.items():
+                original_match_attempts[source] = {
+                    'exact_match_attempts': stats['exact_match_attempts'],
+                    'fuzzy_match_attempts': stats['fuzzy_match_attempts']
+                }
+            
+            # Reset match stats to avoid double counting successes
+            # But preserve the attempt counts to maintain accurate success rates
+            self.match_stats = copy.deepcopy(original_match_stats)
+            
+            # Restore the actual attempt counts
+            for source, stats in original_match_attempts.items():
+                if source in self.match_stats:
+                    self.match_stats[source]['exact_match_attempts'] = stats['exact_match_attempts']
+                    self.match_stats[source]['fuzzy_match_attempts'] = stats['fuzzy_match_attempts']
+            
+            # Create a record of which match type was used for each source
+            used_matches = {
+                'elsevier': {'exact': 0, 'fuzzy': 0},
+                'crossref': {'exact': 0, 'fuzzy': 0},
+                'pubmed': {'exact': 0, 'fuzzy': 0},
+                'semantic_scholar': {'exact': 0, 'fuzzy': 0}
+            }
+            
             for i, pub in enumerate(publications):
                 if results[i] is not None:
+                    # Count this match in the statistics
+                    source = results[i].get('source', 'unknown')
+                    if source in self.match_stats:
+                        if results[i].get('match_info', {}).get('fuzzy_matched', False):
+                            # Count as a fuzzy match success
+                            self.match_stats[source]['fuzzy_match_successes'] += 1
+                            used_matches[source]['fuzzy'] += 1
+                        else:
+                            # Count as an exact match success
+                            self.match_stats[source]['exact_match_successes'] += 1
+                            used_matches[source]['exact'] += 1
+                            
+                    # Update the publication with enrichment information
                     pub.update(results[i])
+                    
                 enriched.append(pub)
             
-            return enriched 
+            # Log which matches were actually used
+            logger.debug(f"Used matches (counted in statistics): {used_matches}")
+            
+            return enriched

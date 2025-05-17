@@ -24,7 +24,10 @@ class PublicationProcessor:
                  semantic_scholar_api_key: str = None,
                  batch_size: int = 50,
                  max_concurrent: int = 10,
-                 cache_db: str = "api_cache.db"):
+                 cache_db: str = "api_cache.db",
+                 disable_pubmed: bool = False,
+                 disable_semantic_scholar: bool = False,
+                 status_callback = None):
         """
         Initialize the publication processor.
         
@@ -37,6 +40,8 @@ class PublicationProcessor:
             batch_size: Number of publications to process in each batch
             max_concurrent: Maximum number of concurrent API requests
             cache_db: Path to SQLite cache database
+            disable_pubmed: Set to True to disable PubMed API lookups
+            disable_semantic_scholar: Set to True to disable Semantic Scholar API lookups
         """
         self.api_client = APIClient(
             elsevier_api_key=elsevier_api_key,
@@ -45,8 +50,13 @@ class PublicationProcessor:
             crossref_email=crossref_email,
             semantic_scholar_api_key=semantic_scholar_api_key,
             max_concurrent=max_concurrent,
-            cache_db=cache_db
+            cache_db=cache_db,
+            disable_pubmed=disable_pubmed,
+            disable_semantic_scholar=disable_semantic_scholar
         )
+        
+        # Store callback for progress reporting
+        self.status_callback = status_callback
         self.batch_size = batch_size
     
     async def setup(self):
@@ -77,7 +87,8 @@ class PublicationProcessor:
     async def process_csv(self,
                          input_path: str,
                          output_path: str,
-                         checkpoint_path: Optional[str] = None) -> Dict:
+                         checkpoint_path: Optional[str] = None,
+                         disable_progress: bool = False) -> Dict:
         """
         Process CSV file to enrich publications with abstracts.
         
@@ -137,16 +148,18 @@ class PublicationProcessor:
             'sources': self.source_counts
         }
         
-        # Create a progress bar without using async context manager
-        pbar = tqdm(total=total_pubs, initial=start_idx)
+        # Create a progress bar without using async context manager (if not disabled)
+        if not disable_progress:
+            pbar = tqdm(total=total_pubs, initial=start_idx)
+        
         for i in range(start_idx, total_pubs, self.batch_size):
             batch = df.iloc[i:i + self.batch_size].to_dict('records')
             
             # Process batch
             enriched_batch = await self.api_client.verify_publications(batch)
             
-            # Update statistics
-            for pub in enriched_batch:
+            # Update statistics - and report progress for EACH publication
+            for idx, pub in enumerate(enriched_batch):
                 if pub.get('abstract'):
                     self.enriched_count += 1
                     # Track the source that provided this enrichment
@@ -155,26 +168,33 @@ class PublicationProcessor:
                         self.source_counts[source] += 1
                 else:
                     self.failed_count += 1
+                    
+                # Call status callback frequently - on every publication
+                if self.status_callback and (idx % 1 == 0):  # Update on every publication
+                    self.status_callback(self.enriched_count, self.failed_count)
+                
+                # Update progress bar frequently too
+                if not disable_progress:
+                    pbar.update(1)  # Update one at a time for smoother progress
+                    if idx % 5 == 0:  # Only update the postfix text occasionally to avoid slowdown
+                        pbar.set_postfix(
+                            enriched=self.enriched_count,
+                            failed=self.failed_count
+                        )
             
             processed_data.extend(enriched_batch)
             stats['processed'] += len(enriched_batch)
             
-            # Save checkpoint
+            # Save checkpoint after each batch
             if checkpoint_path:
                 await self.save_checkpoint(processed_data, checkpoint_path)
             
-            # Update progress bar
-            pbar.update(len(enriched_batch))
-            
             # Update processed count
             self.processed_count += len(enriched_batch)
-            pbar.set_postfix(
-                enriched=self.enriched_count,
-                failed=self.failed_count
-            )
         
-        # Close the progress bar
-        pbar.close()
+        # Close the progress bar if it exists
+        if not disable_progress:
+            pbar.close()
         
         # Save final results to output file
         result_df = pd.DataFrame(processed_data)
@@ -189,15 +209,43 @@ class PublicationProcessor:
         for idx, row in result_df.iterrows():
             match_info = row.get('match_info')
             if isinstance(match_info, dict):
-                result_df.at[idx, 'match_type'] = match_info.get('match_type')
-                result_df.at[idx, 'fuzzy_matched'] = match_info.get('fuzzy_matched', False)
+                # Get the match type and fuzzy matched flag
+                match_type = match_info.get('match_type')
+                fuzzy_matched = match_info.get('fuzzy_matched', False)
+                
+                # Store in the dataframe
+                result_df.at[idx, 'match_type'] = match_type
+                result_df.at[idx, 'fuzzy_matched'] = fuzzy_matched
                 result_df.at[idx, 'match_score'] = match_info.get('match_score')
                 result_df.at[idx, 'original_query_title'] = match_info.get('query_title')
+                
+                # Log some samples to help debug
+                if idx < 5 and match_type:  # Just log a few samples
+                    logger.debug(f"Sample match_info: Publication {idx}, match_type={match_type}, fuzzy={fuzzy_matched}")
+            elif row.get('source') and row.get('abstract'):  # Fallback for old format records
+                # Default to 'exact' if we have a source and abstract but no match_info
+                result_df.at[idx, 'match_type'] = 'exact'
+                result_df.at[idx, 'fuzzy_matched'] = False
         
-        # Count match types for reporting
+        # Count match types for reporting with more detail
+        # Track DOI matches, exact title matches, and fuzzy matches separately
+        doi_matches = ((result_df['match_type'] == 'doi') & result_df['abstract'].notna()).sum()
+        exact_title_matches = ((result_df['match_type'] == 'exact') & result_df['abstract'].notna()).sum()
+        other_exact_matches = ((~result_df['fuzzy_matched']) & 
+                             (result_df['match_type'] != 'doi') & 
+                             (result_df['match_type'] != 'exact') & 
+                             result_df['abstract'].notna()).sum()
+        fuzzy_matches = result_df['fuzzy_matched'].sum()
+        
+        # Total exact matches is the sum of DOI, exact title, and other exact matches
+        exact_matches = doi_matches + exact_title_matches + other_exact_matches
+        
         match_stats = {
-            'exact_matches': (result_df['match_type'] == 'exact').sum(),
-            'fuzzy_matches': result_df['fuzzy_matched'].sum()
+            'exact_matches': exact_matches,
+            'doi_matches': doi_matches,
+            'exact_title_matches': exact_title_matches,
+            'other_exact_matches': other_exact_matches,
+            'fuzzy_matches': fuzzy_matches
         }
         
         # Save with match information columns
