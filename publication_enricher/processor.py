@@ -18,6 +18,10 @@ logger = logging.getLogger(__name__)
 class PublicationProcessor:
     def __init__(self, 
                  elsevier_api_key: str,
+                 pubmed_email: str = None,
+                 pubmed_api_key: str = None,
+                 crossref_email: str = None,
+                 semantic_scholar_api_key: str = None,
                  batch_size: int = 50,
                  max_concurrent: int = 10,
                  cache_db: str = "api_cache.db"):
@@ -26,12 +30,20 @@ class PublicationProcessor:
         
         Args:
             elsevier_api_key: API key for Elsevier
+            pubmed_email: Email for PubMed (optional)
+            pubmed_api_key: API key for PubMed (optional)
+            crossref_email: Email for Crossref API (optional)
+            semantic_scholar_api_key: API key for Semantic Scholar (optional)
             batch_size: Number of publications to process in each batch
             max_concurrent: Maximum number of concurrent API requests
             cache_db: Path to SQLite cache database
         """
         self.api_client = APIClient(
             elsevier_api_key=elsevier_api_key,
+            pubmed_email=pubmed_email,
+            pubmed_api_key=pubmed_api_key,
+            crossref_email=crossref_email,
+            semantic_scholar_api_key=semantic_scholar_api_key,
             max_concurrent=max_concurrent,
             cache_db=cache_db
         )
@@ -82,6 +94,17 @@ class PublicationProcessor:
         total_pubs = len(df)
         logger.info(f"Found {total_pubs} publications to process")
         
+        # Check and map column names if necessary
+        column_mapping = {}
+        if 'Output_Title' in df.columns and 'title' not in df.columns:
+            column_mapping['Output_Title'] = 'title'
+        if 'Ref_DOI' in df.columns and 'doi' not in df.columns:
+            column_mapping['Ref_DOI'] = 'doi'
+            
+        # Apply column mapping if needed
+        if column_mapping:
+            df = df.rename(columns=column_mapping)
+        
         # Initialize or load from checkpoint
         processed_data = []
         start_idx = 0
@@ -94,48 +117,82 @@ class PublicationProcessor:
                 logger.info(f"Resuming from checkpoint with {start_idx} publications already processed")
         
         # Process in batches
-        stats = {
-            'total': total_pubs,
-            'processed': start_idx,
-            'enriched': 0,
-            'failed': 0
+        self.total_count = len(df)
+        self.processed_count = 0
+        self.enriched_count = 0
+        self.failed_count = 0
+        self.source_counts = {
+            'elsevier': 0,
+            'pubmed': 0,
+            'crossref': 0,
+            'semantic_scholar': 0
         }
         
-        async with tqdm(total=total_pubs, initial=start_idx) as pbar:
-            for i in range(start_idx, total_pubs, self.batch_size):
-                batch = df.iloc[i:i + self.batch_size].to_dict('records')
-                
-                # Process batch
-                enriched_batch = await self.api_client.verify_publications(batch)
-                
-                # Update statistics
-                for pub in enriched_batch:
-                    if pub.get('abstract'):
-                        stats['enriched'] += 1
-                    else:
-                        stats['failed'] += 1
-                
-                processed_data.extend(enriched_batch)
-                stats['processed'] += len(enriched_batch)
-                
-                # Save checkpoint
-                if checkpoint_path:
-                    await self.save_checkpoint(processed_data, checkpoint_path)
-                
-                # Update progress bar
-                pbar.update(len(enriched_batch))
-                pbar.set_postfix(
-                    enriched=stats['enriched'],
-                    failed=stats['failed']
-                )
+        # Initialize stats dictionary
+        stats = {
+            'total': total_pubs,
+            'processed': 0,
+            'enriched': 0,
+            'failed': 0,
+            'sources': self.source_counts
+        }
         
-        # Save final results
+        # Create a progress bar without using async context manager
+        pbar = tqdm(total=total_pubs, initial=start_idx)
+        for i in range(start_idx, total_pubs, self.batch_size):
+            batch = df.iloc[i:i + self.batch_size].to_dict('records')
+            
+            # Process batch
+            enriched_batch = await self.api_client.verify_publications(batch)
+            
+            # Update statistics
+            for pub in enriched_batch:
+                if pub.get('abstract'):
+                    self.enriched_count += 1
+                    # Track the source that provided this enrichment
+                    source = pub.get('source', 'unknown')
+                    if source in self.source_counts:
+                        self.source_counts[source] += 1
+                else:
+                    self.failed_count += 1
+            
+            processed_data.extend(enriched_batch)
+            stats['processed'] += len(enriched_batch)
+            
+            # Save checkpoint
+            if checkpoint_path:
+                await self.save_checkpoint(processed_data, checkpoint_path)
+            
+            # Update progress bar
+            pbar.update(len(enriched_batch))
+            
+            # Update processed count
+            self.processed_count += len(enriched_batch)
+            pbar.set_postfix(
+                enriched=self.enriched_count,
+                failed=self.failed_count
+            )
+        
+        # Close the progress bar
+        pbar.close()
+        
+        # Save final results to output file
         result_df = pd.DataFrame(processed_data)
         result_df.to_csv(output_path, index=False)
+        
+        # Prepare final stats with source breakdown
+        stats = {
+            'total': self.total_count,
+            'processed': self.processed_count,
+            'enriched': self.enriched_count,
+            'failed': self.failed_count,
+            'sources': self.source_counts
+        }
         
         logger.info("\nProcessing complete!")
         logger.info(f"Total publications: {stats['total']}")
         logger.info(f"Successfully enriched: {stats['enriched']}")
         logger.info(f"Failed to enrich: {stats['failed']}")
+        logger.info(f"Source breakdown: {stats['sources']}")
         
-        return stats 
+        return stats
