@@ -71,7 +71,8 @@ def find_best_title_match(search_title: str, candidates: List[Dict], threshold: 
         threshold: Minimum score to consider a match (0-100)
         
     Returns:
-        Optional[Dict]: Best matching candidate or None if no match found
+        Optional[Dict]: Best matching candidate or None if no match found.
+                       Adds a 'match_info' key with matching details for verification.
     """
     if not candidates:
         return None
@@ -81,6 +82,7 @@ def find_best_title_match(search_title: str, candidates: List[Dict], threshold: 
     
     best_score = 0
     best_match = None
+    best_score_type = None
     
     for candidate in candidates:
         if 'title' in candidate and candidate['title']:
@@ -90,13 +92,25 @@ def find_best_title_match(search_title: str, candidates: List[Dict], threshold: 
             
             # Use the higher of the two scores
             score = max(token_sort_ratio, token_set_ratio)
+            score_type = "token_sort_ratio" if token_sort_ratio > token_set_ratio else "token_set_ratio"
             
             if score > best_score and score >= threshold:
                 best_score = score
                 best_match = candidate
+                best_score_type = score_type
     
     if best_match:
-        logger.debug(f"Found title match with score {best_score}: '{search_title}' -> '{best_match.get('title')}'")  
+        logger.debug(f"Found title match with score {best_score}: '{search_title}' -> '{best_match.get('title')}'")
+        
+        # Add match information to the result for verification
+        best_match['match_info'] = {
+            'fuzzy_matched': True,
+            'query_title': search_title,
+            'matched_title': best_match.get('title'),
+            'match_score': best_score,
+            'match_type': best_score_type,
+            'threshold': threshold
+        }
     
     return best_match
 
@@ -110,6 +124,7 @@ class APIClient:
                  cache_db: str = "api_cache.db",
                  max_concurrent: int = 10,
                  cache_ttl_days: int = 30):
+        
         """
         Initialize the API client.
         
@@ -133,6 +148,34 @@ class APIClient:
         self.has_pubmed = (self.pubmed_email is not None) or (self.pubmed_api_key is not None)
         self.has_crossref = True  # Crossref has a public API that works without auth
         self.has_semantic_scholar = True  # Semantic Scholar has a public API with rate limits
+        
+        # Match statistics tracking
+        self.match_stats = {
+            'elsevier': {
+                'exact_match_attempts': 0,
+                'exact_match_successes': 0,
+                'fuzzy_match_attempts': 0,
+                'fuzzy_match_successes': 0
+            },
+            'pubmed': {
+                'exact_match_attempts': 0,
+                'exact_match_successes': 0,
+                'fuzzy_match_attempts': 0,
+                'fuzzy_match_successes': 0
+            },
+            'crossref': {
+                'exact_match_attempts': 0,
+                'exact_match_successes': 0,
+                'fuzzy_match_attempts': 0,
+                'fuzzy_match_successes': 0
+            },
+            'semantic_scholar': {
+                'exact_match_attempts': 0,
+                'exact_match_successes': 0,
+                'fuzzy_match_attempts': 0,
+                'fuzzy_match_successes': 0
+            }
+        }
         
         # Error tracking
         self.pubmed_error_count = 0
@@ -177,6 +220,36 @@ class APIClient:
         self.cache_ttl_days = cache_ttl_days
         self.semaphore = asyncio.Semaphore(max_concurrent)
         
+    def get_match_statistics(self) -> Dict:
+        """Get comprehensive statistics about matching attempts and successes.
+        
+        Returns:
+            Dict containing detailed matching statistics for all APIs
+        """
+        # Calculate overall stats
+        total_exact_attempts = sum(stats['exact_match_attempts'] for source, stats in self.match_stats.items())
+        total_exact_successes = sum(stats['exact_match_successes'] for source, stats in self.match_stats.items())
+        total_fuzzy_attempts = sum(stats['fuzzy_match_attempts'] for source, stats in self.match_stats.items())
+        total_fuzzy_successes = sum(stats['fuzzy_match_successes'] for source, stats in self.match_stats.items())
+        
+        # Calculate success rates
+        exact_success_rate = (total_exact_successes / total_exact_attempts * 100) if total_exact_attempts > 0 else 0
+        fuzzy_success_rate = (total_fuzzy_successes / total_fuzzy_attempts * 100) if total_fuzzy_attempts > 0 else 0
+        
+        return {
+            'by_source': self.match_stats,
+            'totals': {
+                'exact_match_attempts': total_exact_attempts,
+                'exact_match_successes': total_exact_successes,
+                'fuzzy_match_attempts': total_fuzzy_attempts,
+                'fuzzy_match_successes': total_fuzzy_successes
+            },
+            'rates': {
+                'exact_success_rate': round(exact_success_rate, 1),
+                'fuzzy_success_rate': round(fuzzy_success_rate, 1)
+            }
+        }
+    
     async def setup(self):
         """Initialize the cache database."""
         async with aiosqlite.connect(self.cache_db) as db:
@@ -397,12 +470,20 @@ class APIClient:
             return await self.with_rate_limit(source, do_request())
     
     async def get_abstract_by_doi(self, session: aiohttp.ClientSession, doi: str) -> Optional[Dict]:
-        """Get publication metadata by DOI from Elsevier API."""
+        """Get publication metadata from Elsevier API by DOI."""
         cache_key = f"doi:{doi}"
         
         # Check cache first
         cached = await self.get_from_cache(cache_key)
         if cached:
+            # If cache hit contains match_info, count it for statistics
+            if isinstance(cached, dict) and 'match_info' in cached:
+                source = cached.get('source', 'elsevier')
+                if source in self.match_stats:
+                    if cached['match_info'].get('fuzzy_matched', False):
+                        self.match_stats[source]['fuzzy_match_successes'] += 1
+                    else:
+                        self.match_stats[source]['exact_match_successes'] += 1
             return cached
         
         try:
@@ -463,6 +544,129 @@ class APIClient:
         
         return None
         
+    async def get_abstract_from_crossref_by_title(self, session: aiohttp.ClientSession, title: str) -> Optional[Dict]:
+        """Search for publication by title using Crossref API with exact matching first, then fuzzy matching as fallback."""
+        if not self.has_crossref:
+            return None
+            
+        cache_key = f"crossref_title:{title}"
+        
+        # Check cache first
+        cached = await self.get_from_cache(cache_key)
+        if cached:
+            # Count cache hits for statistics
+            if isinstance(cached, dict) and 'match_info' in cached:
+                if cached['match_info'].get('fuzzy_matched', False):
+                    self.match_stats['crossref']['fuzzy_match_successes'] += 1
+                else:
+                    self.match_stats['crossref']['exact_match_successes'] += 1
+            return cached
+        
+        try:
+            # STEP 1: Try exact match first
+            self.match_stats['crossref']['exact_match_attempts'] += 1
+            
+            # Prepare exact search URL with appropriate quoting for title
+            exact_url = "https://api.crossref.org/works"
+            exact_params = {
+                'query.bibliographic': f'"{title}"',  # Quote the title for exact phrase matching
+                'rows': 2,  # Limit results for exact match
+                'sort': 'score',  # Sort by relevance score
+                'order': 'desc'   # Most relevant first
+            }
+            
+            # Add polite parameter if email is provided
+            if self.crossref_email:
+                exact_params['mailto'] = self.crossref_email
+                
+            exact_data = await self._make_request(session, exact_url, exact_params, source='crossref')
+            
+            # Check if we have an exact match
+            if exact_data and exact_data.get('message') and exact_data['message'].get('items'):
+                items = exact_data['message']['items']
+                if items and len(items) > 0:
+                    # Check the top result for an exact title match (case-insensitive)
+                    top_item = items[0]
+                    if top_item.get('title'):
+                        item_title = top_item['title'][0] if isinstance(top_item['title'], list) else top_item['title']
+                        
+                        if item_title.lower() == title.lower():
+                            # Exact match found
+                            self.match_stats['crossref']['exact_match_successes'] += 1
+                            
+                            # Extract abstract if available (rare in Crossref)
+                            abstract = top_item.get('abstract')
+                            
+                            # Get DOI
+                            doi = top_item.get('DOI')
+                            
+                            result = {
+                                'title': item_title,
+                                'doi': doi,
+                                'abstract': abstract,  # Often None from Crossref
+                                'source': 'crossref',
+                                'match_info': {
+                                    'fuzzy_matched': False,
+                                    'query_title': title,
+                                    'matched_title': item_title,
+                                    'match_type': 'exact'
+                                }
+                            }
+                            await self.save_to_cache(cache_key, result)
+                            return result
+            
+            # STEP 2: If exact match failed, try fuzzy matching with a broader search
+            self.match_stats['crossref']['fuzzy_match_attempts'] += 1
+            
+            # For fuzzy search, remove quotes and use normalized title
+            search_title = normalize_title(title)
+            # Get first few words for a broader search
+            search_words = search_title.split()[:5]  # First 5 words
+            search_query = ' '.join(search_words)
+            
+            fuzzy_params = {
+                'query.bibliographic': search_query,
+                'rows': 10,  # Get more results for fuzzy matching
+                'sort': 'score',
+                'order': 'desc'
+            }
+            
+            # Add polite parameter if email is provided
+            if self.crossref_email:
+                fuzzy_params['mailto'] = self.crossref_email
+                
+            fuzzy_data = await self._make_request(session, exact_url, fuzzy_params, source='crossref')
+            
+            if fuzzy_data and fuzzy_data.get('message') and fuzzy_data['message'].get('items'):
+                items = fuzzy_data['message']['items']
+                if items and len(items) > 0:
+                    # Prepare candidates for fuzzy matching
+                    candidates = []
+                    for item in items:
+                        if item.get('title'):
+                            item_title = item['title'][0] if isinstance(item['title'], list) else item['title']
+                            candidates.append({
+                                'title': item_title,
+                                'doi': item.get('DOI'),
+                                'abstract': item.get('abstract'),  # Usually None
+                                'source': 'crossref'
+                            })
+                    
+                    # Find best match using fuzzy matching
+                    best_match = find_best_title_match(title, candidates, threshold=90)
+                    
+                    if best_match:
+                        self.match_stats['crossref']['fuzzy_match_successes'] += 1
+                        await self.save_to_cache(cache_key, best_match)
+                        return best_match
+                        
+        except Exception as e:
+            # Silent fail for individual title lookups
+            logger.debug(f"Crossref title search error: {str(e)}")
+            pass
+        
+        return None
+    
     async def get_abstract_from_semantic_scholar_by_doi(self, session: aiohttp.ClientSession, doi: str) -> Optional[Dict]:
         """Get publication metadata from Semantic Scholar by DOI."""
         cache_key = f"semantic_scholar_doi:{doi}"
@@ -470,6 +674,12 @@ class APIClient:
         # Check cache first
         cached = await self.get_from_cache(cache_key)
         if cached:
+            # Count cache hits for statistics
+            if isinstance(cached, dict) and 'match_info' in cached:
+                if cached['match_info'].get('fuzzy_matched', False):
+                    self.match_stats['semantic_scholar']['fuzzy_match_successes'] += 1
+                else:
+                    self.match_stats['semantic_scholar']['exact_match_successes'] += 1
             return cached
         
         try:
@@ -485,7 +695,12 @@ class APIClient:
                     'title': data.get('title'),
                     'doi': doi,
                     'abstract': data.get('abstract'),
-                    'source': 'semantic_scholar'
+                    'source': 'semantic_scholar',
+                    'match_info': {
+                        'fuzzy_matched': False,
+                        'query_doi': doi,
+                        'match_type': 'doi'
+                    }
                 }
                 await self.save_to_cache(cache_key, result)
                 return result
@@ -497,73 +712,186 @@ class APIClient:
         return None
 
     async def get_abstract_from_semantic_scholar_by_title(self, session: aiohttp.ClientSession, title: str) -> Optional[Dict]:
-        """Search for publication by title using Semantic Scholar API."""
+        """Search for publication by title using Semantic Scholar API with exact matching first, then fuzzy matching as fallback."""
         cache_key = f"semantic_scholar_title:{title}"
         
         # Check cache first
         cached = await self.get_from_cache(cache_key)
         if cached:
+            # Count cache hits for statistics
+            if isinstance(cached, dict) and 'match_info' in cached:
+                if cached['match_info'].get('fuzzy_matched', False):
+                    self.match_stats['semantic_scholar']['fuzzy_match_successes'] += 1
+                else:
+                    self.match_stats['semantic_scholar']['exact_match_successes'] += 1
             return cached
         
         try:
+            # STEP 1: Try exact match first
+            self.match_stats['semantic_scholar']['exact_match_attempts'] += 1
             url = "https://api.semanticscholar.org/graph/v1/paper/search"
-            params = {
-                'query': title,
+            exact_params = {
+                'query': f'"{title}"',  # Use quotes for exact phrase matching
                 'fields': 'title,abstract,doi',
                 'limit': 1
             }
             
-            data = await self._make_request(session, url, params, source='semantic_scholar')
+            exact_data = await self._make_request(session, url, exact_params, source='semantic_scholar')
             
-            if data and data.get('data') and len(data['data']) > 0:
-                paper = data['data'][0]
-                if paper.get('abstract'):
+            # Check if we got an exact match
+            if (exact_data and exact_data.get('data') and len(exact_data['data']) > 0 and 
+                exact_data['data'][0].get('abstract') and exact_data['data'][0].get('title')):
+                
+                paper = exact_data['data'][0]
+                # Check if titles match exactly (case-insensitive)
+                if paper.get('title').lower() == title.lower():
+                    self.match_stats['semantic_scholar']['exact_match_successes'] += 1
                     result = {
                         'title': paper.get('title'),
                         'doi': paper.get('doi'),
                         'abstract': paper.get('abstract'),
-                        'source': 'semantic_scholar'
+                        'source': 'semantic_scholar',
+                        'match_info': {
+                            'fuzzy_matched': False,
+                            'query_title': title,
+                            'matched_title': paper.get('title'),
+                            'match_type': 'exact'
+                        }
                     }
                     await self.save_to_cache(cache_key, result)
                     return result
+            
+            # STEP 2: If exact match failed, try fuzzy matching
+            self.match_stats['semantic_scholar']['fuzzy_match_attempts'] += 1
+            # Remove special characters that might interfere with search
+            search_title = normalize_title(title)
+            search_words = search_title.split()[:5]  # First 5 words for broader search
+            search_query = ' '.join(search_words)
+            
+            fuzzy_params = {
+                'query': search_query,
+                'fields': 'title,abstract,doi',
+                'limit': 10  # Get multiple results for fuzzy matching
+            }
+            
+            fuzzy_data = await self._make_request(session, url, fuzzy_params, source='semantic_scholar')
+            
+            if fuzzy_data and fuzzy_data.get('data') and len(fuzzy_data['data']) > 0:
+                # Prepare candidates for fuzzy matching
+                candidates = [{
+                    'title': paper.get('title'),
+                    'doi': paper.get('doi'),
+                    'abstract': paper.get('abstract'),
+                    'source': 'semantic_scholar'
+                } for paper in fuzzy_data['data'] if paper.get('abstract')]
+                
+                # Find best match using fuzzy matching with high threshold (90%)
+                best_match = find_best_title_match(title, candidates, threshold=90)
+                
+                if best_match:
+                    self.match_stats['semantic_scholar']['fuzzy_match_successes'] += 1
+                    await self.save_to_cache(cache_key, best_match)
+                    return best_match
                 
         except Exception as e:
             # Silent fail for individual title lookups
+            logger.debug(f"Semantic Scholar title search error: {str(e)}")
             pass
         
         return None
     
     async def get_abstract_by_title(self, session: aiohttp.ClientSession, title: str) -> Optional[Dict]:
-        """Search for publication by title using Elsevier API."""
+        """Search for publication by title using Elsevier API with exact matching first, then fuzzy matching as fallback."""
         cache_key = f"title:{title}"
         
         # Check cache first
         cached = await self.get_from_cache(cache_key)
         if cached:
+            # If cache hit contains match_info, count it for statistics
+            if isinstance(cached, dict) and 'match_info' in cached:
+                source = cached.get('source', 'elsevier')
+                if source in self.match_stats:
+                    if cached['match_info'].get('fuzzy_matched', False):
+                        self.match_stats[source]['fuzzy_match_successes'] += 1
+                    else:
+                        self.match_stats[source]['exact_match_successes'] += 1
             return cached
         
         try:
+            # STEP 1: Try exact title match first (faster)
+            self.match_stats['elsevier']['exact_match_attempts'] += 1
             url = "https://api.elsevier.com/content/search/scopus"
-            params = {
+            exact_params = {
                 'query': f'title("{title}")',
                 'field': 'dc:title,dc:identifier,abstract'
             }
             
-            data = await self._make_request(session, url, params, source='elsevier')
+            exact_data = await self._make_request(session, url, exact_params, source='elsevier')
             
-            if 'search-results' in data and data['search-results'].get('entry'):
-                entry = data['search-results']['entry'][0]
-                result = {
+            # Check if we got an exact match
+            if ('search-results' in exact_data and 
+                exact_data['search-results'].get('entry') and 
+                len(exact_data['search-results']['entry']) > 0):
+                
+                entry = exact_data['search-results']['entry'][0]
+                # Check if titles match exactly (case-insensitive)
+                if entry.get('dc:title') and entry.get('dc:title').lower() == title.lower():
+                    self.match_stats['elsevier']['exact_match_successes'] += 1
+                    result = {
+                        'title': entry.get('dc:title'),
+                        'doi': entry.get('prism:doi'),
+                        'abstract': entry.get('dc:description'),
+                        'source': 'elsevier',
+                        'match_info': {
+                            'fuzzy_matched': False,
+                            'query_title': title,
+                            'matched_title': entry.get('dc:title'),
+                            'match_type': 'exact'
+                        }
+                    }
+                    await self.save_to_cache(cache_key, result)
+                    return result
+            
+            # STEP 2: If exact match failed, try fuzzy matching
+            self.match_stats['elsevier']['fuzzy_match_attempts'] += 1
+            
+            # Remove quotes and special characters that might interfere with search
+            search_title = re.sub(r'["\[\]\(\)\{\}]', '', title)
+            
+            # Get first few words of the title for a broader search
+            search_words = search_title.split()[:5]  # First 5 words
+            search_query = ' '.join(search_words)
+            
+            fuzzy_params = {
+                'query': f'title({search_query})',
+                'field': 'dc:title,dc:identifier,abstract',
+                'count': 10  # Get multiple results for fuzzy matching
+            }
+            
+            fuzzy_data = await self._make_request(session, url, fuzzy_params, source='elsevier')
+            
+            if 'search-results' in fuzzy_data and fuzzy_data['search-results'].get('entry'):
+                entries = fuzzy_data['search-results']['entry']
+                
+                # Prepare candidate list for fuzzy matching
+                candidates = [{
                     'title': entry.get('dc:title'),
                     'doi': entry.get('prism:doi'),
                     'abstract': entry.get('dc:description'),
                     'source': 'elsevier'
-                }
-                await self.save_to_cache(cache_key, result)
-                return result
+                } for entry in entries]
+                
+                # Find best match using fuzzy matching with high threshold (90%)
+                best_match = find_best_title_match(title, candidates, threshold=90)
+                
+                if best_match:
+                    self.match_stats['elsevier']['fuzzy_match_successes'] += 1
+                    await self.save_to_cache(cache_key, best_match)
+                    return best_match
                 
         except Exception as e:
             # Silent fail for individual title lookups
+            logger.debug(f"Elsevier title search error: {str(e)}")
             pass
         
         return None
@@ -663,7 +991,7 @@ class APIClient:
         return None
         
     async def get_abstract_from_pubmed_by_title(self, session: aiohttp.ClientSession, title: str) -> Optional[Dict]:
-        """Get publication metadata from PubMed by title."""
+        """Get publication metadata from PubMed by title using exact matching first, then fuzzy matching as fallback."""
         if not self.has_pubmed or self.pubmed_disabled:
             return None
             
@@ -678,33 +1006,41 @@ class APIClient:
         # Check cache first
         cached = await self.get_from_cache(cache_key)
         if cached:
+            # Count cache hits for statistics
+            if isinstance(cached, dict) and 'match_info' in cached:
+                if cached['match_info'].get('fuzzy_matched', False):
+                    self.match_stats['pubmed']['fuzzy_match_successes'] += 1
+                else:
+                    self.match_stats['pubmed']['exact_match_successes'] += 1
             return cached
         
         try:
-            # Search for articles by title
+            # STEP 1: Try exact match first
+            self.match_stats['pubmed']['exact_match_attempts'] += 1
             encoded_title = urllib.parse.quote(title)
             search_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
-            search_params = {
+            exact_params = {
                 'db': 'pubmed',
-                'term': f"\"{encoded_title}\"[Title]",
+                'term': f"\"{encoded_title}\"[Title]",  # Exact phrase match
                 'retmode': 'json',
                 'retmax': 1
             }
             
             if self.pubmed_email:
-                search_params['email'] = self.pubmed_email
-                search_params['tool'] = 'PublicationEnricher'
+                exact_params['email'] = self.pubmed_email
+                exact_params['tool'] = 'PublicationEnricher'
                 
             # Add API key as parameter if available
             if self.pubmed_api_key:
-                search_params['api_key'] = self.pubmed_api_key
+                exact_params['api_key'] = self.pubmed_api_key
                 
-            search_data = await self._make_request(session, search_url, search_params, source='pubmed')
+            exact_data = await self._make_request(session, search_url, exact_params, source='pubmed')
             
-            if search_data.get('esearchresult', {}).get('idlist') and len(search_data['esearchresult']['idlist']) > 0:
-                pmid = search_data['esearchresult']['idlist'][0]
+            # Check if we got an exact match
+            if exact_data.get('esearchresult', {}).get('idlist') and len(exact_data['esearchresult']['idlist']) > 0:
+                pmid = exact_data['esearchresult']['idlist'][0]
                 
-                # Then fetch the abstract using the PMID
+                # Fetch the exact match
                 fetch_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
                 fetch_params = {
                     'db': 'pubmed',
@@ -715,28 +1051,122 @@ class APIClient:
                 if self.pubmed_email:
                     fetch_params['email'] = self.pubmed_email
                     fetch_params['tool'] = 'PublicationEnricher'
+                    
+                if self.pubmed_api_key:
+                    fetch_params['api_key'] = self.pubmed_api_key
                 
                 # For XML, we'll use text() instead of json()
                 async with self.semaphore:
                     async with session.get(fetch_url, params=fetch_params) as response:
                         response.raise_for_status()
                         xml_text = await response.text()
-                        
-                # Basic extraction of abstract from XML
-                abstract_match = re.search(r'<AbstractText[^>]*>([\s\S]*?)</AbstractText>', xml_text)
+                
                 title_match = re.search(r'<ArticleTitle>([\s\S]*?)</ArticleTitle>', xml_text)
+                abstract_match = re.search(r'<AbstractText[^>]*>([\s\S]*?)</AbstractText>', xml_text)
                 doi_match = re.search(r'<ArticleId IdType="doi">([^<]+)</ArticleId>', xml_text)
                 
-                if abstract_match:
+                # Check if we got a valid abstract and the title exactly matches
+                if abstract_match and title_match and title_match.group(1).lower() == title.lower():
+                    self.match_stats['pubmed']['exact_match_successes'] += 1
                     result = {
-                        'title': title_match.group(1) if title_match else title,
+                        'title': title_match.group(1),
                         'doi': doi_match.group(1) if doi_match else None,
                         'abstract': abstract_match.group(1),
                         'pmid': pmid,
-                        'source': 'pubmed'
+                        'source': 'pubmed',
+                        'match_info': {
+                            'fuzzy_matched': False,
+                            'query_title': title,
+                            'matched_title': title_match.group(1),
+                            'match_type': 'exact'
+                        }
                     }
                     await self.save_to_cache(cache_key, result)
                     return result
+            
+            # STEP 2: If exact match failed, try fuzzy matching
+            self.match_stats['pubmed']['fuzzy_match_attempts'] += 1
+            # Use a broader search with just the main keywords
+            search_title = normalize_title(title)
+            search_words = search_title.split()[:5]  # First 5 words for broader search
+            search_query = ' '.join(search_words)
+            encoded_search = urllib.parse.quote(search_query)
+            
+            fuzzy_params = {
+                'db': 'pubmed',
+                'term': f"{encoded_search}[Title]",  # No quotes for broader search
+                'retmode': 'json',
+                'retmax': 10  # Get more results for fuzzy matching
+            }
+            
+            if self.pubmed_email:
+                fuzzy_params['email'] = self.pubmed_email
+                fuzzy_params['tool'] = 'PublicationEnricher'
+                
+            # Add API key as parameter if available
+            if self.pubmed_api_key:
+                fuzzy_params['api_key'] = self.pubmed_api_key
+                
+            fuzzy_data = await self._make_request(session, search_url, fuzzy_params, source='pubmed')
+            
+            # Get multiple PMIDs for fuzzy matching
+            pmids = []
+            if fuzzy_data.get('esearchresult', {}).get('idlist'):
+                pmids = fuzzy_data['esearchresult']['idlist']
+                
+                # If we have PMIDs, collect them into candidate results for fuzzy matching
+                candidates = []
+                
+                # Process up to 5 PMIDs to avoid too many requests
+                for pmid in pmids[:5]:
+                    try:
+                        # Fetch the abstract using the PMID
+                        fetch_url = f"https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+                        fetch_params = {
+                            'db': 'pubmed',
+                            'id': pmid,
+                            'retmode': 'xml',
+                        }
+                        
+                        if self.pubmed_email:
+                            fetch_params['email'] = self.pubmed_email
+                            fetch_params['tool'] = 'PublicationEnricher'
+                            
+                        if self.pubmed_api_key:
+                            fetch_params['api_key'] = self.pubmed_api_key
+                        
+                        # For XML, we'll use text() instead of json()
+                        async with self.semaphore:
+                            async with session.get(fetch_url, params=fetch_params) as response:
+                                response.raise_for_status()
+                                xml_text = await response.text()
+                                
+                        # Basic extraction of abstract and other data from XML
+                        abstract_match = re.search(r'<AbstractText[^>]*>([\s\S]*?)</AbstractText>', xml_text)
+                        title_match = re.search(r'<ArticleTitle>([\s\S]*?)</ArticleTitle>', xml_text)
+                        doi_match = re.search(r'<ArticleId IdType="doi">([^<]+)</ArticleId>', xml_text)
+                        
+                        if abstract_match and title_match:
+                            candidates.append({
+                                'title': title_match.group(1),
+                                'doi': doi_match.group(1) if doi_match else None,
+                                'abstract': abstract_match.group(1),
+                                'pmid': pmid,
+                                'source': 'pubmed'
+                            })
+                    except Exception as e:
+                        # Skip this PMID and try the next one
+                        logger.debug(f"Error processing PMID {pmid}: {str(e)}")
+                        continue
+                
+                # Apply fuzzy matching to find the best match
+                if candidates:
+                    best_match = find_best_title_match(title, candidates, threshold=90)
+                    
+                    if best_match:
+                        self.match_stats['pubmed']['fuzzy_match_successes'] += 1
+                        await self.save_to_cache(cache_key, best_match)
+                        return best_match
         
         except aiohttp.ClientResponseError as e:
             # Check for rate limiting (HTTP 429)
@@ -771,33 +1201,62 @@ class APIClient:
             need_lookup = list(range(len(publications)))
             
             #-----------------------------------------------------
-            # PHASE 1: Try Crossref first for publications with DOIs
+            # PHASE 1: Try Crossref first for all publications (DOI first, then title)
             #-----------------------------------------------------
             if self.has_crossref and need_lookup:
-                crossref_tasks = []
-                crossref_indices = []
+                # STEP 1a: Try Crossref DOI lookup for publications with DOIs
+                crossref_doi_tasks = []
+                crossref_doi_indices = []
                 
                 for i in need_lookup:
                     pub = publications[i]
                     if pub.get('doi') and str(pub['doi']).lower() != 'nan':
                         task = self.get_abstract_from_crossref_by_doi(session, pub['doi'])
-                        crossref_tasks.append(task)
-                        crossref_indices.append(i)
+                        crossref_doi_tasks.append(task)
+                        crossref_doi_indices.append(i)
                 
-                if crossref_tasks:
-                    crossref_results = await asyncio.gather(*crossref_tasks, return_exceptions=True)
+                if crossref_doi_tasks:
+                    crossref_doi_results = await asyncio.gather(*crossref_doi_tasks, return_exceptions=True)
                     
                     # Process results
                     still_need_lookup = []
-                    for task_idx, pub_idx in enumerate(crossref_indices):
-                        result = crossref_results[task_idx]
+                    for task_idx, pub_idx in enumerate(crossref_doi_indices):
+                        result = crossref_doi_results[task_idx]
                         if not isinstance(result, Exception) and result is not None and result.get('abstract'):
                             results[pub_idx] = result
                         else:
                             still_need_lookup.append(pub_idx)
                     
-                    # Only keep indices that were in crossref_indices and need further lookup
-                    need_lookup = [idx for idx in need_lookup if idx in crossref_indices and idx in still_need_lookup] + [idx for idx in need_lookup if idx not in crossref_indices]
+                    # Update need_lookup list to remove successful lookups
+                    need_lookup = [idx for idx in need_lookup if idx in crossref_doi_indices and idx in still_need_lookup] + \
+                                 [idx for idx in need_lookup if idx not in crossref_doi_indices]
+                
+                # STEP 1b: For remaining publications, try Crossref title lookup
+                crossref_title_tasks = []
+                crossref_title_indices = []
+                
+                for i in need_lookup:
+                    pub = publications[i]
+                    if pub.get('title'):
+                        task = self.get_abstract_from_crossref_by_title(session, pub['title'])
+                        crossref_title_tasks.append(task)
+                        crossref_title_indices.append(i)
+                
+                if crossref_title_tasks:
+                    crossref_title_results = await asyncio.gather(*crossref_title_tasks, return_exceptions=True)
+                    
+                    # Process results
+                    still_need_lookup = []
+                    for task_idx, pub_idx in enumerate(crossref_title_indices):
+                        result = crossref_title_results[task_idx]
+                        if not isinstance(result, Exception) and result is not None and result.get('abstract'):
+                            results[pub_idx] = result
+                        else:
+                            still_need_lookup.append(pub_idx)
+                    
+                    # Update need_lookup list to remove successful lookups
+                    need_lookup = [idx for idx in need_lookup if idx in crossref_title_indices and idx in still_need_lookup] + \
+                                 [idx for idx in need_lookup if idx not in crossref_title_indices]
             
             #-----------------------------------------------------
             # PHASE 2: Try Elsevier for publications that still need it

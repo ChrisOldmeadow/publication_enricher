@@ -178,6 +178,29 @@ class PublicationProcessor:
         
         # Save final results to output file
         result_df = pd.DataFrame(processed_data)
+        
+        # Extract match information into separate columns for easier analysis
+        result_df['match_type'] = None
+        result_df['fuzzy_matched'] = False
+        result_df['match_score'] = None
+        result_df['original_query_title'] = None
+        
+        # Extract match information from nested dictionaries
+        for idx, row in result_df.iterrows():
+            match_info = row.get('match_info')
+            if isinstance(match_info, dict):
+                result_df.at[idx, 'match_type'] = match_info.get('match_type')
+                result_df.at[idx, 'fuzzy_matched'] = match_info.get('fuzzy_matched', False)
+                result_df.at[idx, 'match_score'] = match_info.get('match_score')
+                result_df.at[idx, 'original_query_title'] = match_info.get('query_title')
+        
+        # Count match types for reporting
+        match_stats = {
+            'exact_matches': (result_df['match_type'] == 'exact').sum(),
+            'fuzzy_matches': result_df['fuzzy_matched'].sum()
+        }
+        
+        # Save with match information columns
         result_df.to_csv(output_path, index=False)
         
         # Prepare final stats with source breakdown
@@ -189,10 +212,58 @@ class PublicationProcessor:
             'sources': self.source_counts
         }
         
+        # Add match stats to the overall stats
+        stats['match_types'] = match_stats
+        
+        # Get matching attempt statistics from API client
+        match_attempt_stats = self.api_client.get_match_statistics()
+        stats['match_attempts'] = match_attempt_stats
+        
         logger.info("\nProcessing complete!")
         logger.info(f"Total publications: {stats['total']}")
         logger.info(f"Successfully enriched: {stats['enriched']}")
         logger.info(f"Failed to enrich: {stats['failed']}")
         logger.info(f"Source breakdown: {stats['sources']}")
+        
+        # Matching statistics section
+        logger.info(f"\nMatch statistics:")
+        logger.info(f"  - Exact matches: {match_stats['exact_matches']}")
+        logger.info(f"  - Fuzzy matches: {match_stats['fuzzy_matches']}")
+        
+        # Detailed match attempt statistics
+        logger.info(f"\nMatching attempt statistics:")
+        logger.info(f"  - Exact match attempts: {match_attempt_stats['totals']['exact_match_attempts']}")
+        logger.info(f"  - Exact match successes: {match_attempt_stats['totals']['exact_match_successes']}")
+        logger.info(f"  - Exact match success rate: {match_attempt_stats['rates']['exact_success_rate']}%")
+        logger.info(f"  - Fuzzy match attempts: {match_attempt_stats['totals']['fuzzy_match_attempts']}")
+        logger.info(f"  - Fuzzy match successes: {match_attempt_stats['totals']['fuzzy_match_successes']}")
+        logger.info(f"  - Fuzzy match success rate: {match_attempt_stats['rates']['fuzzy_success_rate']}%")
+        
+        # Per-source statistics
+        logger.info(f"\nPer-source match statistics:")
+        for source, stats in match_attempt_stats['by_source'].items():
+            if stats['exact_match_attempts'] > 0 or stats['fuzzy_match_attempts'] > 0:
+                exact_rate = (stats['exact_match_successes'] / stats['exact_match_attempts'] * 100) if stats['exact_match_attempts'] > 0 else 0
+                fuzzy_rate = (stats['fuzzy_match_successes'] / stats['fuzzy_match_attempts'] * 100) if stats['fuzzy_match_attempts'] > 0 else 0
+                logger.info(f"  - {source.capitalize()}:")
+                logger.info(f"    * Exact: {stats['exact_match_successes']}/{stats['exact_match_attempts']} ({round(exact_rate, 1)}%)")
+                logger.info(f"    * Fuzzy: {stats['fuzzy_match_successes']}/{stats['fuzzy_match_attempts']} ({round(fuzzy_rate, 1)}%)")
+        
+        # If there were fuzzy matches, give information about score distribution
+        if match_stats['fuzzy_matches'] > 0:
+            # Calculate basic stats about fuzzy match scores
+            fuzzy_scores = result_df[result_df['fuzzy_matched']]['match_score']
+            if len(fuzzy_scores) > 0:
+                logger.info(f"\nFuzzy match score details:")
+                logger.info(f"  - Score range: {fuzzy_scores.min()}-{fuzzy_scores.max()}")
+                logger.info(f"  - Average score: {fuzzy_scores.mean():.1f}")
+                # Log number of matches in different score ranges
+                score_ranges = {
+                    '90-94': ((fuzzy_scores >= 90) & (fuzzy_scores < 95)).sum(),
+                    '95-99': ((fuzzy_scores >= 95) & (fuzzy_scores < 100)).sum(),
+                    '100': (fuzzy_scores == 100).sum()
+                }
+                logger.info(f"  - Score distribution: {score_ranges}")
+        
         
         return stats

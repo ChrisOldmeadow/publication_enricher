@@ -75,6 +75,13 @@ async def process_chunk(chunk_df, output_path, elsevier_key, pubmed_email, cross
             checkpoint_path=checkpoint_path
         )
         
+        # Extract match stats for logging
+        match_stats = processor.api_client.get_match_statistics()
+        
+        # Include match stats explicitly in the returned stats
+        if 'match_attempts' not in stats:
+            stats['match_attempts'] = match_stats
+        
         # Read processed data
         if os.path.exists(temp_output):
             return pd.read_csv(temp_output), stats
@@ -113,7 +120,42 @@ def worker_process(chunk_df, output_queue, elsevier_key, pubmed_email, crossref_
     
     except Exception as e:
         logging.error(f"Process {process_id} failed: {str(e)}")
-        output_queue.put((process_id, chunk_df, {"error": str(e)}))
+        # Return a properly structured stats dictionary even in case of error
+        error_stats = {
+            "error": str(e),
+            "processed": 0,
+            "enriched": 0,
+            "failed": len(chunk_df),
+            "sources": {
+                "elsevier": 0,
+                "pubmed": 0,
+                "crossref": 0,
+                "semantic_scholar": 0
+            },
+            "match_types": {
+                "exact_matches": 0,
+                "fuzzy_matches": 0
+            },
+            "match_attempts": {
+                "by_source": {
+                    "elsevier": {"exact_match_attempts": 0, "exact_match_successes": 0, "fuzzy_match_attempts": 0, "fuzzy_match_successes": 0},
+                    "pubmed": {"exact_match_attempts": 0, "exact_match_successes": 0, "fuzzy_match_attempts": 0, "fuzzy_match_successes": 0},
+                    "crossref": {"exact_match_attempts": 0, "exact_match_successes": 0, "fuzzy_match_attempts": 0, "fuzzy_match_successes": 0},
+                    "semantic_scholar": {"exact_match_attempts": 0, "exact_match_successes": 0, "fuzzy_match_attempts": 0, "fuzzy_match_successes": 0}
+                },
+                "totals": {
+                    "exact_match_attempts": 0,
+                    "exact_match_successes": 0,
+                    "fuzzy_match_attempts": 0,
+                    "fuzzy_match_successes": 0
+                },
+                "rates": {
+                    "exact_success_rate": 0,
+                    "fuzzy_success_rate": 0
+                }
+            }
+        }
+        output_queue.put((process_id, chunk_df, error_stats))
 
 def main():
     # Load environment variables
@@ -275,68 +317,213 @@ def main():
     
     # Collect results
     results = []
+    all_process_stats = []
+    
+    # For stats aggregation, start with basic information
     stats = {
-        "total": total_pubs, 
-        "processed": 0, 
-        "enriched": 0, 
-        "failed": 0, 
-        "sources": {
-            "elsevier": 0,
-            "pubmed": 0,
-            "crossref": 0,
-            "semantic_scholar": 0
-        }
+        "total": total_pubs
     }
     
+    # Collect results from all worker processes
     for _ in range(len(processes)):
         process_id, result_df, process_stats = result_queue.get()
         results.append((process_id, result_df))
+        all_process_stats.append(process_stats)
         
-        # Update overall stats
-        if "processed" in process_stats:
-            stats["processed"] += process_stats["processed"]
-        if "enriched" in process_stats:
-            stats["enriched"] += process_stats["enriched"]
-        if "failed" in process_stats:
-            stats["failed"] += process_stats["failed"]
-        
-        # Update source counts
-        if "sources" in process_stats:
-            for source, count in process_stats["sources"].items():
-                if source in stats["sources"]:
-                    stats["sources"][source] += count
+        # We'll use get_stats_summary instead of manually aggregating here
     
     # Sort results by process_id to maintain order
     results.sort(key=lambda x: x[0])
     
-    # Combine results
+    # Combine results dataframes
     combined_df = pd.concat([r[1] for r in results], ignore_index=True)
+    
+    # Generate a clean summary of the stats using our helper
+    stats = get_stats_summary(all_process_stats, total_pubs)
+    
+    # Double-check enrichment success based on the combined dataframe
+    has_abstract = combined_df['abstract'].notna()
+    actual_enriched_count = has_abstract.sum()
+    
+    # If there's a discrepancy, update the stats
+    if actual_enriched_count > 0 and stats['enriched'] == 0:
+        logging.info(f"Updated enrichment count from dataframe: {actual_enriched_count}")
+        stats['enriched'] = actual_enriched_count
+        stats['failed'] = len(combined_df) - actual_enriched_count
     
     # Save final results
     combined_df.to_csv(output_path, index=False)
     
-    elapsed_time = time.time() - start_time
-    logging.info(f"\nProcessing complete in {elapsed_time:.2f} seconds!")
+    end_time = time.time()
+    logging.info(f"\nProcessing complete in {end_time - start_time:.2f} seconds!")
     logging.info(f"Total publications: {stats['total']}")
-    logging.info(f"Successfully enriched: {stats['enriched']}")
-    logging.info(f"Failed to enrich: {stats['failed']}")
     
-    # Display source breakdown
-    source_stats = stats['sources']
-    non_zero_sources = {k: v for k, v in source_stats.items() if v > 0}
-    if non_zero_sources:
-        logging.info("\nEnrichment sources breakdown:")
-        for source, count in non_zero_sources.items():
-            percentage = (count / stats['enriched'] * 100) if stats['enriched'] > 0 else 0
-            logging.info(f"  - {source}: {count} ({percentage:.1f}%)")
+    # Calculate and log the enrichment success percentage
+    enrichment_percentage = 0.0
+    if stats['total'] > 0:
+        enrichment_percentage = (stats['enriched'] / stats['total']) * 100
+    
+    logging.info(f"Successfully enriched: {stats['enriched']} ({enrichment_percentage:.1f}%)")
+    logging.info(f"Failed to enrich: {stats['failed']} ({100 - enrichment_percentage:.1f}%)")
+    
+    
+    # Log source breakdown
+    sources_sum = sum(stats['sources'].values())
+    if sources_sum > 0:
+        logging.info(f"Source breakdown: {stats['sources']}")
+    elif stats['enriched'] > 0:
+        # If we have enrichments but no source counts, infer sources from match statistics
+        inferred_sources = {}
+        if 'match_attempts' in stats and 'by_source' in stats['match_attempts']:
+            for source, source_stats in stats['match_attempts']['by_source'].items():
+                exact_successes = source_stats.get('exact_match_successes', 0)
+                fuzzy_successes = source_stats.get('fuzzy_match_successes', 0)
+                if exact_successes > 0 or fuzzy_successes > 0:
+                    inferred_sources[source] = exact_successes + fuzzy_successes
+        
+        if inferred_sources:
+            logging.info(f"Source breakdown (inferred from match statistics): {inferred_sources}")
+        else:
+            logging.info(f"Successfully enriched {stats['enriched']} publications, but source breakdown unavailable.")
     else:
-        logging.info("No enrichments from any source.")
-    
+        logging.info(f"No enrichments from any source.")
+        
+    # Log match statistics
+    if 'match_types' in stats:
+        logging.info(f"\nMatch statistics:")
+        logging.info(f"  - Exact matches: {stats['match_types']['exact_matches']}")
+        logging.info(f"  - Fuzzy matches: {stats['match_types']['fuzzy_matches']}")
+        
+    # Log match attempt statistics - with defensive checks
+    try:
+        if 'match_attempts' in stats:
+            if 'totals' in stats['match_attempts']:
+                totals = stats['match_attempts']['totals']
+                rates = stats['match_attempts'].get('rates', {'exact_success_rate': 0, 'fuzzy_success_rate': 0})
+                
+                logging.info(f"\nMatching attempt statistics:")
+                logging.info(f"  - Exact match attempts: {totals.get('exact_match_attempts', 0)}")
+                logging.info(f"  - Exact match successes: {totals.get('exact_match_successes', 0)}")
+                logging.info(f"  - Exact match success rate: {rates.get('exact_success_rate', 0)}%")
+                logging.info(f"  - Fuzzy match attempts: {totals.get('fuzzy_match_attempts', 0)}")
+                logging.info(f"  - Fuzzy match successes: {totals.get('fuzzy_match_successes', 0)}")
+                logging.info(f"  - Fuzzy match success rate: {rates.get('fuzzy_success_rate', 0)}%")
+                
+                # Per-source match statistics
+                if 'by_source' in stats['match_attempts']:
+                    logging.info(f"\nPer-source match statistics:")
+                    for source, source_stats in stats['match_attempts']['by_source'].items():
+                        # Safely get the statistics with defaults
+                        exact_attempts = source_stats.get('exact_match_attempts', 0)
+                        exact_successes = source_stats.get('exact_match_successes', 0)
+                        fuzzy_attempts = source_stats.get('fuzzy_match_attempts', 0)
+                        fuzzy_successes = source_stats.get('fuzzy_match_successes', 0)
+                        
+                        if exact_attempts > 0 or fuzzy_attempts > 0:
+                            exact_rate = (exact_successes / exact_attempts * 100) if exact_attempts > 0 else 0
+                            fuzzy_rate = (fuzzy_successes / fuzzy_attempts * 100) if fuzzy_attempts > 0 else 0
+                            logging.info(f"  - {source.capitalize()}:")
+                            logging.info(f"    * Exact: {exact_successes}/{exact_attempts} ({round(exact_rate, 1)}%)")
+                            logging.info(f"    * Fuzzy: {fuzzy_successes}/{fuzzy_attempts} ({round(fuzzy_rate, 1)}%)")
+    except Exception as e:
+        logging.error(f"Error when logging match statistics: {str(e)}")
+        # Continue execution even if there's an error with the statistics reporting
+
     return stats
+
+def get_stats_summary(all_worker_stats, total_pubs=0):
+    """Generate a clean, comprehensive summary of all statistics from worker processes.
+    
+    Args:
+        all_worker_stats: List of statistics dictionaries from worker processes
+        total_pubs: The total number of publications being processed (may not be available in worker stats)
+    """
+    # Start with a fresh stats dictionary
+    calculated_total = sum(s.get('total', 0) for s in all_worker_stats)
+    
+    summary = {
+        # Use the passed total_pubs if greater than 0, otherwise use the calculated total
+        "total": total_pubs if total_pubs > 0 else calculated_total,
+        "processed": sum(s.get('processed', 0) for s in all_worker_stats),
+        "enriched": sum(s.get('enriched', 0) for s in all_worker_stats),
+        "failed": sum(s.get('failed', 0) for s in all_worker_stats),
+        "sources": {}
+    }
+    
+    # Aggregate source counts
+    source_types = ['elsevier', 'pubmed', 'crossref', 'semantic_scholar']
+    for source in source_types:
+        summary['sources'][source] = sum(s.get('sources', {}).get(source, 0) for s in all_worker_stats)
+    
+    # Aggregate match type counts (with defaults if missing)
+    summary['match_types'] = {
+        'exact_matches': sum(s.get('match_types', {}).get('exact_matches', 0) for s in all_worker_stats),
+        'fuzzy_matches': sum(s.get('match_types', {}).get('fuzzy_matches', 0) for s in all_worker_stats)
+    }
+    
+    # Initialize match attempt stats with a structure guaranteeing all expected fields
+    summary['match_attempts'] = {
+        'totals': {
+            'exact_match_attempts': 0,
+            'exact_match_successes': 0,
+            'fuzzy_match_attempts': 0,
+            'fuzzy_match_successes': 0
+        },
+        'rates': {
+            'exact_success_rate': 0.0,
+            'fuzzy_success_rate': 0.0
+        },
+        'by_source': {}
+    }
+    
+    # Initialize source-specific stats
+    for source in source_types:
+        summary['match_attempts']['by_source'][source] = {
+            'exact_match_attempts': 0,
+            'exact_match_successes': 0,
+            'fuzzy_match_attempts': 0,
+            'fuzzy_match_successes': 0
+        }
+    
+    # Aggregate match attempt statistics
+    for stats in all_worker_stats:
+        # Add match_attempts with defensive access using get() to avoid KeyError
+        match_attempts = stats.get('match_attempts', {})
+        
+        # Aggregate by-source stats safely
+        for source in source_types:
+            source_stats = match_attempts.get('by_source', {}).get(source, {})
+            for stat_key in ['exact_match_attempts', 'exact_match_successes', 'fuzzy_match_attempts', 'fuzzy_match_successes']:
+                value = source_stats.get(stat_key, 0)
+                summary['match_attempts']['by_source'][source][stat_key] += value
+        
+        # Aggregate totals safely
+        totals_stats = match_attempts.get('totals', {})
+        for key in ['exact_match_attempts', 'exact_match_successes', 'fuzzy_match_attempts', 'fuzzy_match_successes']:
+            value = totals_stats.get(key, 0)
+            summary['match_attempts']['totals'][key] += value
+    
+    # Calculate rates
+    totals = summary['match_attempts']['totals']
+    if totals['exact_match_attempts'] > 0:
+        summary['match_attempts']['rates']['exact_success_rate'] = round(
+            totals['exact_match_successes'] / totals['exact_match_attempts'] * 100, 1)
+    if totals['fuzzy_match_attempts'] > 0:
+        summary['match_attempts']['rates']['fuzzy_success_rate'] = round(
+            totals['fuzzy_match_successes'] / totals['fuzzy_match_attempts'] * 100, 1)
+    
+    return summary
 
 if __name__ == "__main__":
     try:
-        main()
+        # Add an exception handler for the entire main function
+        try:
+            main()
+        except KeyError as ke:
+            # Handle specific key errors that might occur during stats processing
+            logging.error(f"Key error in statistics processing: {str(ke)}")
+            logging.info("Continuing execution despite statistics error...")
+            sys.exit(0)
     except Exception as e:
         logging.error(f"Fatal error: {str(e)}")
         sys.exit(1)
