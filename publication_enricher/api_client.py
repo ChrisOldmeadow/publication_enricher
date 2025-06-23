@@ -20,6 +20,49 @@ from .ngram_matcher import enhanced_title_similarity
 
 logger = logging.getLogger(__name__)
 
+def clean_abstract_html(abstract: str) -> str:
+    """Remove HTML/XML tags from abstract text while preserving content.
+    
+    Handles various tag formats including namespaced tags like <jats:p>.
+    """
+    if not abstract:
+        return ""
+    
+    # Remove all HTML/XML tags including namespaced ones
+    cleaned = re.sub(r'<[^>]+>', ' ', abstract)
+    
+    # Replace HTML entities
+    html_entities = {
+        '&lt;': '<',
+        '&gt;': '>',
+        '&amp;': '&',
+        '&quot;': '"',
+        '&apos;': "'",
+        '&nbsp;': ' ',
+        '&mdash;': '—',
+        '&ndash;': '–',
+        '&ldquo;': '"',
+        '&rdquo;': '"',
+        '&lsquo;': "'",
+        '&rsquo;': "'",
+        '&hellip;': '...'
+    }
+    
+    for entity, replacement in html_entities.items():
+        cleaned = cleaned.replace(entity, replacement)
+    
+    # Handle numeric entities
+    cleaned = re.sub(r'&#(\d+);', lambda m: chr(int(m.group(1))), cleaned)
+    cleaned = re.sub(r'&#x([0-9a-fA-F]+);', lambda m: chr(int(m.group(1), 16)), cleaned)
+    
+    # Clean up extra whitespace
+    cleaned = re.sub(r'\s+', ' ', cleaned)
+    
+    # Remove leading/trailing whitespace
+    cleaned = cleaned.strip()
+    
+    return cleaned
+
 def normalize_title(title: str) -> str:
     """Normalize title for better matching.
     
@@ -709,7 +752,7 @@ class APIClient:
                 result = {
                     'title': data['full-text-retrieval-response'].get('coredata', {}).get('dc:title'),
                     'doi': doi,
-                    'abstract': data['full-text-retrieval-response'].get('coredata', {}).get('dc:description'),
+                    'abstract': clean_abstract_html(data['full-text-retrieval-response'].get('coredata', {}).get('dc:description', '')) if data['full-text-retrieval-response'].get('coredata', {}).get('dc:description') else None,
                     'source': 'elsevier',
                     'match_info': {
                         'fuzzy_matched': False,
@@ -759,7 +802,7 @@ class APIClient:
                 result = {
                     'title': title,
                     'doi': doi,
-                    'abstract': abstract,  # Often None from Crossref
+                    'abstract': clean_abstract_html(abstract) if abstract else None,  # Often None from Crossref
                     'source': 'crossref',
                     'match_info': {
                         'fuzzy_matched': False,
@@ -841,7 +884,7 @@ class APIClient:
                             result = {
                                 'title': item_title,
                                 'doi': doi,
-                                'abstract': abstract,  # Often None from Crossref
+                                'abstract': clean_abstract_html(abstract) if abstract else None,  # Often None from Crossref
                                 'source': 'crossref',
                                 'match_info': {
                                     'fuzzy_matched': False,
@@ -886,7 +929,7 @@ class APIClient:
                             candidates.append({
                                 'title': item_title,
                                 'doi': item.get('DOI'),
-                                'abstract': item.get('abstract'),  # Usually None
+                                'abstract': clean_abstract_html(item.get('abstract', '')) if item.get('abstract') else None,  # Usually None
                                 'source': 'crossref'
                             })
                     
@@ -971,7 +1014,7 @@ class APIClient:
                 result = {
                     'title': data.get('title'),
                     'doi': doi,
-                    'abstract': data.get('abstract'),
+                    'abstract': clean_abstract_html(data.get('abstract', '')) if data.get('abstract') else None,
                     'source': 'semantic_scholar',
                     'match_info': {
                         'fuzzy_matched': False,
@@ -1036,7 +1079,7 @@ class APIClient:
                         result = {
                         'title': paper.get('title'),
                         'doi': paper.get('doi'),
-                        'abstract': paper.get('abstract'),
+                        'abstract': clean_abstract_html(paper.get('abstract', '')) if paper.get('abstract') else None,
                         'source': 'semantic_scholar',
                         'match_info': {
                             'fuzzy_matched': False,
@@ -1072,7 +1115,7 @@ class APIClient:
                         candidate = {
                             'title': paper.get('title'),
                             'doi': paper.get('doi'),
-                            'abstract': paper.get('abstract'),
+                            'abstract': clean_abstract_html(paper.get('abstract', '')) if paper.get('abstract') else None,
                             'source': 'semantic_scholar'
                         }
                         
@@ -1151,7 +1194,7 @@ class APIClient:
                         result = {
                         'title': entry.get('dc:title'),
                         'doi': entry.get('prism:doi'),
-                        'abstract': entry.get('dc:description'),
+                        'abstract': clean_abstract_html(entry.get('dc:description', '')) if entry.get('dc:description') else None,
                         'source': 'elsevier',
                         'match_info': {
                             'fuzzy_matched': False,
@@ -1191,7 +1234,7 @@ class APIClient:
                     candidate = {
                         'title': entry.get('dc:title'),
                         'doi': entry.get('prism:doi'),
-                        'abstract': entry.get('dc:description'),
+                        'abstract': clean_abstract_html(entry.get('dc:description', '')) if entry.get('dc:description') else None,
                         'source': 'elsevier'
                     }
                     
@@ -1310,7 +1353,7 @@ class APIClient:
                     result = {
                         'title': title_match.group(1) if title_match else None,
                         'doi': doi,
-                        'abstract': abstract_match.group(1),
+                        'abstract': clean_abstract_html(abstract_match.group(1)),
                         'pmid': pmid,
                         'source': 'pubmed',
                         'match_info': {
@@ -1424,7 +1467,7 @@ class APIClient:
                         result = {
                         'title': title_match.group(1),
                         'doi': doi_match.group(1) if doi_match else None,
-                        'abstract': abstract_match.group(1),
+                        'abstract': clean_abstract_html(abstract_match.group(1)),
                         'pmid': pmid,
                         'source': 'pubmed',
                         'match_info': {
@@ -1503,7 +1546,7 @@ class APIClient:
                             candidates.append({
                                 'title': title_match.group(1),
                                 'doi': doi_match.group(1) if doi_match else None,
-                                'abstract': abstract_match.group(1),
+                                'abstract': clean_abstract_html(abstract_match.group(1)),
                                 'pmid': pmid,
                                 'source': 'pubmed'
                             })

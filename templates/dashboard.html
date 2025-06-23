@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Publication Enricher Dashboard</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <link href="{{ url_for('static', filename='css/dashboard.css') }}" rel="stylesheet">
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+        <div class="container-fluid">
+            <a class="navbar-brand" href="#"><i class="fas fa-search"></i> Publication Enricher</a>
+            <div class="navbar-nav ms-auto">
+                <span class="navbar-text me-3">
+                    <span id="status-indicator" class="badge bg-secondary">Checking...</span>
+                </span>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container-fluid mt-4">
+        <div class="row">
+            <!-- API Status Panel -->
+            <div class="col-lg-3 mb-4">
+                <div class="card">
+                    <div class="card-header">
+                        <h5><i class="fas fa-key"></i> API Configuration</h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="api-status">
+                            <div class="d-flex justify-content-between align-items-center mb-2">
+                                <span>Elsevier</span>
+                                <span class="badge" id="elsevier-status">{{ 'bg-success">✓' if env_status.elsevier else 'bg-warning">⚠' }}</span>
+                            </div>
+                            <div class="d-flex justify-content-between align-items-center mb-2">
+                                <span>PubMed Email</span>
+                                <span class="badge" id="pubmed-email-status">{{ 'bg-success">✓' if env_status.pubmed_email else 'bg-warning">⚠' }}</span>
+                            </div>
+                            <div class="d-flex justify-content-between align-items-center mb-2">
+                                <span>PubMed Key</span>
+                                <span class="badge" id="pubmed-key-status">{{ 'bg-success">✓' if env_status.pubmed_key else 'bg-secondary">○' }}</span>
+                            </div>
+                            <div class="d-flex justify-content-between align-items-center mb-2">
+                                <span>Crossref Email</span>
+                                <span class="badge" id="crossref-status">{{ 'bg-success">✓' if env_status.crossref_email else 'bg-secondary">○' }}</span>
+                            </div>
+                            <div class="d-flex justify-content-between align-items-center">
+                                <span>Semantic Scholar</span>
+                                <span class="badge" id="semantic-status">{{ 'bg-success">✓' if env_status.semantic_scholar else 'bg-secondary">○' }}</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Cache Info -->
+                <div class="card mt-3">
+                    <div class="card-header">
+                        <h5><i class="fas fa-database"></i> Cache Info</h5>
+                    </div>
+                    <div class="card-body">
+                        <div id="cache-info">
+                            <p class="text-muted">Loading...</p>
+                        </div>
+                        <button class="btn btn-warning btn-sm" id="clear-cache-btn">
+                            <i class="fas fa-trash"></i> Clear Cache
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Main Content -->
+            <div class="col-lg-9">
+                <!-- File Upload Section -->
+                <div class="card mb-4">
+                    <div class="card-header">
+                        <h5><i class="fas fa-upload"></i> Upload & Start Enrichment</h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="row">
+                            <div class="col-md-6">
+                                <div class="mb-3">
+                                    <label for="file-input" class="form-label">Select CSV File</label>
+                                    <input type="file" class="form-control" id="file-input" accept=".csv">
+                                    <div class="form-text">Select a CSV file with publication data (titles, DOIs)</div>
+                                </div>
+                                
+                                <div class="mb-3">
+                                    <label class="form-label">Or select existing file:</label>
+                                    <select class="form-select" id="existing-files">
+                                        <option value="">Loading files...</option>
+                                    </select>
+                                </div>
+                            </div>
+                            
+                            <div class="col-md-6">
+                                <div class="mb-3">
+                                    <label class="form-label">Processing Options</label>
+                                    <div class="row">
+                                        <div class="col-6">
+                                            <label for="processes" class="form-label">Processes</label>
+                                            <input type="number" class="form-control" id="processes" value="4" min="1" max="8">
+                                        </div>
+                                        <div class="col-6">
+                                            <label for="batch-size" class="form-label">Batch Size</label>
+                                            <input type="number" class="form-control" id="batch-size" value="50" min="10" max="200">
+                                        </div>
+                                    </div>
+                                </div>
+                                
+                                <div class="mb-3">
+                                    <label for="max-concurrent" class="form-label">Max Concurrent</label>
+                                    <input type="number" class="form-control" id="max-concurrent" value="10" min="1" max="20">
+                                </div>
+                                
+                                <div class="mb-3">
+                                    <div class="form-check">
+                                        <input class="form-check-input" type="checkbox" id="disable-pubmed">
+                                        <label class="form-check-label" for="disable-pubmed">Disable PubMed</label>
+                                    </div>
+                                    <div class="form-check">
+                                        <input class="form-check-input" type="checkbox" id="disable-semantic">
+                                        <label class="form-check-label" for="disable-semantic">Disable Semantic Scholar</label>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <button class="btn btn-primary" id="start-enrichment-btn" disabled>
+                            <i class="fas fa-play"></i> Start Enrichment
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Running Processes -->
+                <div class="card">
+                    <div class="card-header">
+                        <h5><i class="fas fa-tasks"></i> Enrichment Processes</h5>
+                    </div>
+                    <div class="card-body">
+                        <div id="processes-container">
+                            <p class="text-muted">No processes running</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Process Modal -->
+    <div class="modal fade" id="processModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">Process Details</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div id="process-details"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
+</body>
+</html>

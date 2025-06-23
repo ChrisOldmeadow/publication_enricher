@@ -84,8 +84,9 @@ python enrich_csv.py input.csv \
   --cache-db cache.db \
   --checkpoint checkpoint.json \
   --elsevier-key YOUR_API_KEY \
-  --pubmed-email YOUR_EMAIL \
+  --pubmed-key YOUR_PUBMED_KEY \
   --crossref-email YOUR_EMAIL \
+  --semantic-scholar-key YOUR_SS_KEY \
   -v
 ```
 
@@ -99,6 +100,10 @@ python multi_process_enricher.py input.csv \
   --batch-size 100 \
   --max-concurrent 20 \
   --processes 4 \
+  --pubmed-email YOUR_EMAIL \
+  --elsevier-key YOUR_API_KEY \
+  --crossref-email YOUR_EMAIL \
+  --semantic-scholar-key YOUR_SS_KEY \
   -v
 ```
 
@@ -113,14 +118,19 @@ python multi_process_enricher.py input.csv \
 
 #### Single-Process Options:
 - `--checkpoint`: Path to save/load checkpoint file
-- `--elsevier-key`: Elsevier API key (can also be set via env var)
-- `--pubmed-email`: Email for PubMed API (can also be set via env var)
-- `--pubmed-key`: API key for PubMed (can also be set via env var)
-- `--crossref-email`: Email for Crossref API (can also be set via env var)
-- `--semantic-scholar-key`: API key for Semantic Scholar (can also be set via env var)
+- `--elsevier-key`: Elsevier API key (can also be set via ELSEVIER_API_KEY env var)
+- `--pubmed-key`: API key for PubMed (can also be set via PUBMED_API_KEY env var)
+- `--crossref-email`: Email for Crossref API (can also be set via CROSSREF_EMAIL env var)
+- `--semantic-scholar-key`: API key for Semantic Scholar (can also be set via SEMANTIC_SCHOLAR_API_KEY env var)
 
 #### Multi-Process Options:
-- `--processes`: Number of parallel processes to use (default: 2)
+- `--processes`: Number of parallel processes to use (default: number of CPU cores)
+- `--elsevier-key`: Elsevier API key (can also be set via ELSEVIER_API_KEY env var)
+- `--pubmed-email`: Email for PubMed API (can also be set via PUBMED_EMAIL env var)
+- `--crossref-email`: Email for Crossref API (can also be set via CROSSREF_EMAIL env var)
+- `--semantic-scholar-key`: API key for Semantic Scholar (can also be set via SEMANTIC_SCHOLAR_API_KEY env var)
+- `--disable-pubmed`: Disable PubMed API lookups (useful if API is down)
+- `--disable-semantic`: Disable Semantic Scholar API lookups (useful if API is down)
 
 ### Configuration and Optimization
 
@@ -142,12 +152,18 @@ python multi_process_enricher.py input.csv \
   --max-concurrent 10
 ```
 
-#### Balanced Performance
+#### Balanced Performance (uses CPU core count by default)
 ```bash
 python multi_process_enricher.py input.csv \
-  --processes 4 \
   --batch-size 50 \
   --max-concurrent 20
+```
+
+#### Disable Problematic APIs
+```bash
+python multi_process_enricher.py input.csv \
+  --disable-pubmed \
+  --disable-semantic
 ```
 
 ## Input CSV Format
@@ -155,14 +171,16 @@ python multi_process_enricher.py input.csv \
 The input CSV file should contain publication information with at least one of these column pairs:
 
 **Standard Column Names:**
-- `title`: Publication title
-- `doi` (optional): DOI of the publication
+- `title`: Publication title (required for enrichment)
+- `doi` (optional): DOI of the publication (improves matching accuracy)
 
 **Alternative Column Names (automatically mapped):**
 - `Output_Title`: Alternative column name for publication title
 - `Ref_DOI`: Alternative column name for publication DOI
 
-The tool will automatically detect and map these alternative column names if present.
+The tool will automatically detect and map these alternative column names if present. At minimum, each row must have a `title` (or `Output_Title`) to perform enrichment. DOIs are optional but significantly improve matching accuracy when available.
+
+**Note:** This is an **enrichment** tool - it starts with your existing publication data and adds abstracts and metadata by searching scientific databases. It does not correct or modify your original titles or DOIs.
 
 Example:
 ```csv
@@ -181,17 +199,43 @@ Output_Title,Ref_DOI,additional_column
 
 ## Output Format
 
-The output CSV will contain all original columns plus:
+### Main Output Files
 
+The tool generates several output files to help you analyze results:
+
+**Primary enriched file** (`*_enriched.csv` or `*_enriched_mp.csv` for multi-process):
+- Contains all original columns plus enriched data
+- Only includes publications that were successfully enriched
+
+**Additional analysis files**:
+- `*_failed.csv`: Publications that couldn't be enriched (no abstract found)
+- `*_fuzzy.csv`: Publications matched using fuzzy title matching (for quality review)
+- `*_missing_data.csv`: Publications missing both DOI and title (cannot be processed)
+
+### Enriched Data Columns
+
+The main output file contains all original columns plus these new columns:
+
+**Core enrichment data**:
 - `abstract`: The publication abstract (if found)
 - `source`: The API source that provided the data (elsevier, pubmed, crossref, or semantic_scholar)
-- `match_info`: Information about how the match was made, including:
-  - `match_type`: 'exact' or 'fuzzy'
-  - `fuzzy_matched`: Boolean indicating if fuzzy matching was used
-  - `query_title`: The original title used for matching
-  - `matched_title`: The title that was matched in the API
-  - `match_score`: For fuzzy matches, the similarity score (90-100)
-- Additional metadata specific to each API source (when available)
+
+**Match tracking columns**:
+- `match_type`: How the match was made ('doi_exact', 'title_exact', or 'title_fuzzy')
+- `fuzzy_matched`: Boolean indicating if fuzzy matching was used
+- `match_score`: For fuzzy matches, the similarity score (90-100)
+- `original_query_title`: The original title used for searching
+
+**Match details (JSON format in `match_info` column)**:
+- `query_title`: The original title used for matching
+- `matched_title`: The title that was matched in the API
+- `match_type`: Detailed match type information
+- `fuzzy_matched`: Boolean flag
+- `match_score`: Similarity score for fuzzy matches
+
+**API-specific metadata** (varies by source):
+- Publication dates, author information, journal details, citation counts, etc.
+- Each API provides different additional fields based on their available data
 
 ## Performance Considerations
 
@@ -226,15 +270,33 @@ The output CSV will contain all original columns plus:
 
 ## Fuzzy Matching and Match Statistics
 
-### Fuzzy Matching Capabilities
+### Enhanced Matching Capabilities
 
-- The enricher uses the `fuzzywuzzy` library for title-based fuzzy matching
-- Default matching threshold is 90% similarity (configurable)
-- Matching process:
-  1. Try exact DOI matching first (if DOI is available)
-  2. Try exact title matching next (case-insensitive)
-  3. Fall back to fuzzy title matching if exact matching fails
-- Each API source is tried in sequence until a match is found
+The enricher uses sophisticated matching algorithms to find publications across multiple APIs:
+
+#### Matching Hierarchy
+1. **DOI Exact Matching**: Most reliable when DOI is available
+2. **Title Exact Matching**: Case-insensitive exact title matches
+3. **Fuzzy Title Matching**: Multiple fuzzy matching techniques with 90% similarity threshold
+
+#### Advanced Fuzzy Matching Features
+- **Multiple fuzzy algorithms**: Uses `fuzzywuzzy` library with ratio, partial ratio, and token-based matching
+- **N-gram character matching**: Advanced character-level similarity for handling typos and formatting differences
+- **Title preprocessing**: Normalizes titles by removing common prefixes, suffixes, and formatting variations
+- **Prefix matching**: Handles truncated titles and abstracts used as titles
+- **Multi-technique scoring**: Combines multiple similarity metrics for robust matching
+
+#### API Processing Order
+Each publication is tried against APIs in sequence until a match is found:
+1. Elsevier API (if enabled and API key available)
+2. PubMed API (if enabled)
+3. Crossref API (if enabled)
+4. Semantic Scholar API (if enabled and API key available)
+
+#### API Reliability Features
+- **Automatic API disabling**: APIs that repeatedly fail are temporarily disabled
+- **Manual API control**: Use `--disable-pubmed` and `--disable-semantic` to skip problematic APIs
+- **Rate limit handling**: Adaptive backoff and retry logic for each API's rate limits
 
 ### Match Statistics
 
