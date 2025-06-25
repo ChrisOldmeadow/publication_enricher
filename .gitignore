@@ -35,6 +35,8 @@ ENV/
 *.csv
 .env
 checkpoint.json
+cache/
+checkpoint_chunk_*.json
 
 # Logs
 *.log 

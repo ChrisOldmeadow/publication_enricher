@@ -84,8 +84,8 @@ async def main():
         parser.add_argument(
             "--cache-db",
             type=str,
-            default="api_cache.db",
-            help="Path to cache database (default: api_cache.db)"
+            default="cache/api_cache.db",
+            help="Path to cache database (default: cache/api_cache.db)"
         )
         
         parser.add_argument(
@@ -130,6 +130,13 @@ async def main():
         
         # Setup logging
         setup_logging(args.verbose)
+        
+        # Ensure cache directory exists
+        cache_dir = os.path.dirname(args.cache_db)
+        if cache_dir and not os.path.exists(cache_dir):
+            os.makedirs(cache_dir, exist_ok=True)
+            print(f"Created cache directory: {cache_dir}", file=sys.stdout)
+            sys.stdout.flush()
         
         # Get API keys
         elsevier_key = args.elsevier_key or os.environ.get('ELSEVIER_API_KEY')

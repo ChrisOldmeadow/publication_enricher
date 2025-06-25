@@ -154,7 +154,7 @@ def worker_process(chunk_df, output_queue, status_queue, elsevier_key, pubmed_em
             batch_size, 
             max_concurrent, 
             cache_db,
-            checkpoint_path=f"checkpoint_chunk_{process_id}.json",
+            checkpoint_path=f"cache/checkpoint_chunk_{process_id}.json",
             process_id=process_id,
             disable_pubmed=disable_pubmed,
             disable_semantic=disable_semantic,
@@ -247,6 +247,19 @@ def main():
     # Load environment variables
     load_dotenv()
     
+    # Check if we're running from the dashboard (job_id passed as environment variable)
+    job_id = os.environ.get('ENRICHMENT_JOB_ID')
+    progress_tracker = None
+    ProgressTracker = None
+    if job_id:
+        try:
+            from progress_tracker import ProgressTracker as PT
+            ProgressTracker = PT
+            # We'll initialize after we know the total count
+        except Exception as e:
+            logging.warning(f"Could not import ProgressTracker: {e}")
+            pass
+    
     # Set up command line argument parser
     parser = argparse.ArgumentParser(
         description="Enrich CSV files with publication abstracts using multiprocessing"
@@ -281,8 +294,8 @@ def main():
     parser.add_argument(
         "--cache-db",
         type=str,
-        default="api_cache.db",
-        help="Path to cache database (default: api_cache.db)"
+        default="cache/api_cache.db",
+        help="Path to cache database (default: cache/api_cache.db)"
     )
     
     parser.add_argument(
@@ -338,6 +351,12 @@ def main():
     
     # Setup logging
     setup_logging(args.verbose)
+    
+    # Ensure cache directory exists
+    cache_dir = os.path.dirname(args.cache_db)
+    if cache_dir and not os.path.exists(cache_dir):
+        os.makedirs(cache_dir, exist_ok=True)
+        logging.info(f"Created cache directory: {cache_dir}")
     
     # Get API keys
     elsevier_key = args.elsevier_key or os.environ.get('ELSEVIER_API_KEY')
@@ -426,6 +445,11 @@ def main():
     process_statuses = {}
     active_processes = len(processes)
     
+    # Initialize progress tracker if running from dashboard
+    if job_id and ProgressTracker:
+        progress_tracker = ProgressTracker(job_id, total_items)
+        logging.info(f"Progress tracking enabled for job: {job_id}")
+    
     # Set up a single progress bar for all processes
     with tqdm(total=total_items, desc="Enriching publications", unit="pub") as pbar:
         while active_processes > 0:
@@ -456,6 +480,10 @@ def main():
                     # Update totals
                     enriched_count += inc_enriched
                     failed_count += inc_failed
+                    
+                    # Update progress tracker if available
+                    if progress_tracker:
+                        progress_tracker.update(enriched_count, failed_count)
                     
                     # Update progress bar description with current stats
                     pbar.set_postfix(enriched=enriched_count, failed=failed_count, refresh=True)
@@ -497,6 +525,10 @@ def main():
                     
                     # Track completed processes
                     process_statuses[process_id] = 'COMPLETED'
+                    
+                    # Update progress tracker if available
+                    if progress_tracker:
+                        progress_tracker.update(enriched_count, failed_count)
                     
                     # Update progress bar description with current stats
                     pbar.set_postfix(enriched=enriched_count, failed=failed_count, refresh=True)
@@ -558,6 +590,35 @@ def main():
     has_abstract = combined_df['abstract'].notna()
     actual_enriched_count = has_abstract.sum()
     
+    # Count publications that received Year information
+    year_enriched_count = 0
+    if 'year' in combined_df.columns:
+        year_enriched_count = combined_df['year'].notna().sum()
+        stats['year_enriched'] = year_enriched_count
+    
+    # Count publications that were found in databases (have some metadata even if no abstract)
+    found_in_db_count = 0
+    found_but_no_abstract_count = 0
+    
+    for idx, row in combined_df.iterrows():
+        # Check if publication was found (has DOI, PMID, authors, year, or source info)
+        has_doi = pd.notna(row.get('doi', '')) and str(row.get('doi', '')).lower() not in ['', 'nan']
+        has_pmid = pd.notna(row.get('pmid', '')) and str(row.get('pmid', '')) != ''
+        has_authors = pd.notna(row.get('authors', '')) and str(row.get('authors', '')) != ''
+        has_year = pd.notna(row.get('year', ''))
+        has_source = pd.notna(row.get('source', '')) and str(row.get('source', '')) not in ['', 'unknown']
+        has_abstract = pd.notna(row.get('abstract', '')) and str(row.get('abstract', '')) != ''
+        
+        # If any metadata was found, it means the publication exists in at least one database
+        if has_doi or has_pmid or has_authors or has_year or has_source:
+            found_in_db_count += 1
+            if not has_abstract:
+                found_but_no_abstract_count += 1
+    
+    stats['found_in_databases'] = found_in_db_count
+    stats['found_but_no_abstract'] = found_but_no_abstract_count
+    stats['not_found_in_any_database'] = len(combined_df) - found_in_db_count
+    
     # If there's a discrepancy, update the stats
     if actual_enriched_count > 0 and stats['enriched'] == 0:
         logging.info(f"Updated enrichment count from dataframe: {actual_enriched_count}")
@@ -575,6 +636,22 @@ def main():
     failed_file = f"{base_name}_failed{ext}"
     failed_df.to_csv(failed_file, index=False)
     logging.info(f"Saved {len(failed_df)} failed matches to {failed_file}")
+    
+    # Save publications not found in any database
+    not_found_df = combined_df[combined_df.apply(
+        lambda row: not any([
+            pd.notna(row.get('doi', '')) and str(row.get('doi', '')).lower() not in ['', 'nan'],
+            pd.notna(row.get('pmid', '')) and str(row.get('pmid', '')) != '',
+            pd.notna(row.get('authors', '')) and str(row.get('authors', '')) != '',
+            pd.notna(row.get('year', '')),
+            pd.notna(row.get('source', '')) and str(row.get('source', '')) not in ['', 'unknown']
+        ]),
+        axis=1
+    )]
+    if len(not_found_df) > 0:
+        not_found_file = f"{base_name}_not_found_in_databases{ext}"
+        not_found_df.to_csv(not_found_file, index=False)
+        logging.info(f"Saved {len(not_found_df)} publications not found in any database to {not_found_file}")
     
     # Identify and save publications with missing data (both DOI and title)
     missing_data_df = combined_df[
@@ -620,6 +697,11 @@ def main():
             logging.info(f"Saved {len(alt_fuzzy_df)} likely fuzzy matches to {alt_fuzzy_file} based on scores")
     
     end_time = time.time()
+    
+    # Mark progress as complete if tracker is available
+    if progress_tracker:
+        progress_tracker.complete(stats.get('enriched', 0), stats.get('failed', 0))
+    
     logging.info(f"\nProcessing complete in {end_time - start_time:.2f} seconds!")
     logging.info(f"Total publications: {stats['total']}")
     
@@ -630,11 +712,31 @@ def main():
     
     logging.info(f"Successfully enriched: {stats['enriched']} ({enrichment_percentage:.1f}%)")
     
+    # Report Year enrichment statistics
+    if 'year_enriched' in stats:
+        year_enriched = stats['year_enriched']
+        year_percentage = (year_enriched / stats['total']) * 100 if stats['total'] > 0 else 0
+        logging.info(f"Publications with Year added: {year_enriched} ({year_percentage:.1f}%)")
+    
+    # Report database lookup statistics
+    if 'found_in_databases' in stats:
+        found_in_db = stats['found_in_databases']
+        not_found = stats.get('not_found_in_any_database', 0)
+        found_no_abstract = stats.get('found_but_no_abstract', 0)
+        
+        found_percentage = (found_in_db / stats['total']) * 100 if stats['total'] > 0 else 0
+        not_found_percentage = (not_found / stats['total']) * 100 if stats['total'] > 0 else 0
+        
+        logging.info(f"\nDatabase lookup results:")
+        logging.info(f"  - Found in databases: {found_in_db} ({found_percentage:.1f}%)")
+        logging.info(f"  - NOT found in any database: {not_found} ({not_found_percentage:.1f}%)")
+        logging.info(f"  - Found but no abstract available: {found_no_abstract}")
+    
     # Report missing data count if available
     missing_data_count = stats.get('missing_data', 0)
     if missing_data_count > 0:
         missing_percentage = (missing_data_count / stats['total']) * 100 if stats['total'] > 0 else 0
-        logging.info(f"Publications with missing data: {missing_data_count} ({missing_percentage:.1f}%)")
+        logging.info(f"Publications with missing input data: {missing_data_count} ({missing_percentage:.1f}%)")
         logging.info(f"Failed to enrich (excluding missing data): {stats['failed'] - missing_data_count} ({(stats['failed'] - missing_data_count) / stats['total'] * 100:.1f}%)")
     else:
         logging.info(f"Failed to enrich: {stats['failed']} ({100 - enrichment_percentage:.1f}%)")

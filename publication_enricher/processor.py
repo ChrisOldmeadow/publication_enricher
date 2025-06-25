@@ -24,7 +24,7 @@ class PublicationProcessor:
                  semantic_scholar_api_key: str = None,
                  batch_size: int = 50,
                  max_concurrent: int = 10,
-                 cache_db: str = "api_cache.db",
+                 cache_db: str = "cache/api_cache.db",
                  disable_pubmed: bool = False,
                  disable_semantic_scholar: bool = False,
                  status_callback = None):
